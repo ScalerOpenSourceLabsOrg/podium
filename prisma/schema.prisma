@@ -1,0 +1,356 @@
+// Podium data model.
+//
+// Read docs/DATA_MODEL.md for what these tables mean. The short version:
+// an Event owns everything; Teams make Submissions; Assignments pair a judge
+// with a submission; Scores hang off assignments, one per criterion.
+//
+// Every table that holds event data carries eventId, even where it could be
+// reached through a relation. This is deliberate: it makes the tenancy filter
+// impossible to forget in a query.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Identity
+// ---------------------------------------------------------------------------
+
+model User {
+  id            String    @id @default(cuid())
+  name          String?
+  email         String    @unique
+  emailVerified DateTime?
+  image         String?
+  githubHandle  String?
+  createdAt     DateTime  @default(now())
+
+  accounts      Account[]
+  sessions      Session[]
+  memberships   EventMembership[]
+  teamMembers   TeamMember[]
+  registrations Registration[]
+  assignments   Assignment[]     @relation("JudgeAssignments")
+}
+
+// Auth.js Prisma adapter tables. Do not edit by hand.
+model Account {
+  id                String  @id @default(cuid())
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String?
+  access_token      String?
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String?
+  session_state     String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model VerificationToken {
+  identifier String
+  token      String   @unique
+  expires    DateTime
+
+  @@unique([identifier, token])
+}
+
+// ---------------------------------------------------------------------------
+// Event
+// ---------------------------------------------------------------------------
+
+enum EventStatus {
+  DRAFT
+  PUBLISHED
+  ARCHIVED
+}
+
+model Event {
+  id          String      @id @default(cuid())
+  slug        String      @unique
+  name        String
+  tagline     String?
+  rulesMd     String      @default("")
+  status      EventStatus @default(DRAFT)
+  timezone    String      @default("Asia/Kolkata")
+  maxTeamSize Int         @default(4)
+
+  // Phase boundaries. All UTC. Enforced server-side, never only in the UI.
+  registrationOpensAt DateTime?
+  registrationClosesAt DateTime?
+  submissionOpensAt   DateTime?
+  submissionClosesAt  DateTime?
+  judgingOpensAt      DateTime?
+  judgingClosesAt     DateTime?
+
+  // Extra submission questions organizers add per event. Answers land in
+  // Submission.customAnswers keyed by the ids defined here.
+  submissionFormSchema Json @default("[]")
+
+  galleryPublic Boolean @default(false)
+  winnersPublic Boolean @default(false)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  memberships   EventMembership[]
+  tracks        Track[]
+  criteria      Criterion[]
+  teams         Team[]
+  registrations Registration[]
+  submissions   Submission[]
+  assignments   Assignment[]
+  awards        Award[]
+}
+
+enum EventRole {
+  ORGANIZER
+  JUDGE
+}
+
+// Who can do what, scoped to one event. A user may organize one event and
+// judge another. Participants are not members — they have a Registration.
+model EventMembership {
+  id      String    @id @default(cuid())
+  eventId String
+  userId  String
+  role    EventRole
+
+  event Event @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  user  User  @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([eventId, userId, role])
+  @@index([eventId])
+}
+
+model Track {
+  id          String  @id @default(cuid())
+  eventId     String
+  name        String
+  description String?
+
+  event       Event        @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  submissions Submission[]
+  awards      Award[]
+
+  @@unique([eventId, name])
+  @@index([eventId])
+}
+
+model Criterion {
+  id          String @id @default(cuid())
+  eventId     String
+  name        String
+  description String?
+  weight      Float  @default(1)
+  maxScore    Int    @default(5)
+  position    Int    @default(0)
+
+  event  Event   @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  scores Score[]
+
+  @@index([eventId])
+}
+
+// ---------------------------------------------------------------------------
+// Participation
+// ---------------------------------------------------------------------------
+
+model Registration {
+  id          String    @id @default(cuid())
+  eventId     String
+  userId      String
+  college     String?
+  yearOfStudy String?
+  phone       String?
+  answers     Json      @default("{}")
+  checkedInAt DateTime?
+  createdAt   DateTime  @default(now())
+
+  event Event @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  user  User  @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([eventId, userId])
+  @@index([eventId])
+}
+
+model Team {
+  id         String   @id @default(cuid())
+  eventId    String
+  name       String
+  inviteCode String   @unique
+  isOpen     Boolean  @default(true)
+  lookingFor String[] @default([])
+  createdAt  DateTime @default(now())
+
+  event      Event        @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  members    TeamMember[]
+  submission Submission?
+
+  @@unique([eventId, name])
+  @@index([eventId])
+}
+
+enum TeamRole {
+  LEADER
+  MEMBER
+}
+
+model TeamMember {
+  id       String   @id @default(cuid())
+  teamId   String
+  userId   String
+  role     TeamRole @default(MEMBER)
+  joinedAt DateTime @default(now())
+
+  team Team @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([teamId, userId])
+  @@index([teamId])
+}
+
+// ---------------------------------------------------------------------------
+// Submissions
+// ---------------------------------------------------------------------------
+
+enum SubmissionStatus {
+  DRAFT
+  SUBMITTED
+}
+
+// Gallery visibility and judgeability are separate flags on purpose: a
+// submission can be shown publicly but excluded from judging (late entry,
+// organizer's own demo), or judged but hidden (withdrawn after the fact).
+enum Visibility {
+  PENDING
+  GALLERY
+  HIDDEN
+}
+
+model Submission {
+  id            String           @id @default(cuid())
+  eventId       String
+  teamId        String           @unique
+  trackId       String?
+  title         String
+  tagline       String?
+  descriptionMd String           @default("")
+  repoUrl       String?
+  demoUrl       String?
+  videoUrl      String?
+  tech          String[]         @default([])
+  customAnswers Json             @default("{}")
+
+  status        SubmissionStatus @default(DRAFT)
+  visibility    Visibility       @default(PENDING)
+  judgeable     Boolean          @default(true)
+
+  // Automated checks (repo age, first commit date). Advisory only — an
+  // organizer decides, the system never disqualifies.
+  integrityFlags Json    @default("{}")
+  organizerNotes String  @default("")
+
+  submittedAt DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  event       Event        @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  team        Team         @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  track       Track?       @relation(fields: [trackId], references: [id], onDelete: SetNull)
+  assignments Assignment[]
+  awards      Award[]
+
+  @@index([eventId])
+  @@index([eventId, visibility])
+}
+
+// ---------------------------------------------------------------------------
+// Judging
+// ---------------------------------------------------------------------------
+
+// One judge's obligation to score one submission. Generated by
+// lib/scoring/assign.ts, then editable by an organizer.
+//
+// isAnchor marks a submission every judge scores. Anchors are what make
+// cross-judge comparison possible: without a shared set, a judge's mean and
+// spread are confounded with the quality of whatever they happened to be
+// assigned. See lib/scoring/normalize.ts.
+model Assignment {
+  id           String @id @default(cuid())
+  eventId      String
+  submissionId String
+  judgeId      String
+  round        Int    @default(1)
+  isAnchor     Boolean @default(false)
+
+  completedAt DateTime?
+  createdAt   DateTime  @default(now())
+
+  event      Event      @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  submission Submission @relation(fields: [submissionId], references: [id], onDelete: Cascade)
+  judge      User       @relation("JudgeAssignments", fields: [judgeId], references: [id], onDelete: Cascade)
+  scores     Score[]
+
+  @@unique([submissionId, judgeId, round])
+  @@index([eventId, judgeId])
+}
+
+model Score {
+  id           String   @id @default(cuid())
+  assignmentId String
+  criterionId  String
+  value        Float
+  comment      String   @default("")
+  updatedAt    DateTime @updatedAt
+
+  assignment Assignment @relation(fields: [assignmentId], references: [id], onDelete: Cascade)
+  criterion  Criterion  @relation(fields: [criterionId], references: [id], onDelete: Cascade)
+
+  @@unique([assignmentId, criterionId])
+  @@index([assignmentId])
+}
+
+// ---------------------------------------------------------------------------
+// Results
+// ---------------------------------------------------------------------------
+
+model Award {
+  id           String  @id @default(cuid())
+  eventId      String
+  trackId      String?
+  name         String
+  description  String?
+  position     Int     @default(0)
+  submissionId String?
+
+  // Set when an organizer overrides the computed ranking. The reason is
+  // required by the UI so the decision is auditable after the event.
+  overrideReason String?
+
+  event      Event       @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  track      Track?      @relation(fields: [trackId], references: [id], onDelete: SetNull)
+  submission Submission? @relation(fields: [submissionId], references: [id], onDelete: SetNull)
+
+  @@index([eventId])
+}

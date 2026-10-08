@@ -1,0 +1,3 @@
+Integration tests. These run against a real Postgres (see .github/workflows/ci.yml),
+not a mock: the thing worth testing here is the eventId filter, and a mock would
+happily agree with a query that forgets it.
