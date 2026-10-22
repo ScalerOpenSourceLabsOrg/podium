@@ -9,7 +9,7 @@ export default async function DashboardLayout({
   params: Promise<{ slug: string }>;
 }) {
   const { slug } = await params;
-  await requireUser();
+  await requireUser(`/dashboard/${slug}/team`);
 
   return (
     <div className="min-h-screen bg-neutral-50 dark:bg-neutral-950 text-neutral-900 dark:text-neutral-100">
@@ -17,7 +17,7 @@ export default async function DashboardLayout({
         <div className="max-w-6xl mx-auto px-6 py-3 flex items-center justify-between">
           <div className="flex items-center gap-6">
             <Link href={`/dashboard/${slug}/team`} className="font-bold text-lg text-purple-600 dark:text-purple-400">
-              Participant Hub
+              Registrant Hub
             </Link>
             <nav className="flex items-center gap-4 text-sm font-medium">
               <Link href={`/dashboard/${slug}/team`} className="hover:text-purple-600">

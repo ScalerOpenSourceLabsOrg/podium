@@ -45,12 +45,25 @@ export async function saveScore(
     throw new Error("Assignment not found or unauthorized");
   }
 
+  const criterion = await prisma.criterion.findFirst({
+    where: { id: criterionId, eventId },
+  });
+  if (!criterion) {
+    throw new Error("Criterion not found or does not belong to this event");
+  }
+
+  if (value < 0 || value > criterion.maxScore) {
+    throw new Error(`Score value must be between 0 and ${criterion.maxScore}`);
+  }
+
+  const cleanComment = typeof comment === "string" ? comment.trim().slice(0, 2000) : "";
+
   const score = await prisma.score.upsert({
     where: {
       assignmentId_criterionId: { assignmentId, criterionId },
     },
-    update: { value, comment },
-    create: { assignmentId, criterionId, value, comment },
+    update: { value, comment: cleanComment },
+    create: { assignmentId, criterionId, value, comment: cleanComment },
   });
 
   // Check if all criteria scored for this assignment to set completedAt

@@ -51,8 +51,15 @@ export async function getRegistrationsForEvent(eventId: string, search?: string)
 }
 
 export async function checkInParticipant(eventId: string, registrationId: string) {
-  return prisma.registration.update({
+  const reg = await prisma.registration.findFirst({
     where: { id: registrationId, eventId },
+  });
+  if (!reg) {
+    throw new Error("Registration not found or unauthorized for this event");
+  }
+
+  return prisma.registration.update({
+    where: { id: registrationId },
     data: { checkedInAt: new Date() },
   });
 }

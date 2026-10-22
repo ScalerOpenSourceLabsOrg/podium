@@ -119,11 +119,27 @@ export async function updateAwardWinner(
   submissionId: string | null,
   overrideReason?: string,
 ) {
-  return prisma.award.update({
+  const award = await prisma.award.findFirst({
     where: { id: awardId, eventId },
+  });
+  if (!award) {
+    throw new Error("Award not found or does not belong to this event");
+  }
+
+  if (submissionId) {
+    const submission = await prisma.submission.findFirst({
+      where: { id: submissionId, eventId },
+    });
+    if (!submission) {
+      throw new Error("Winning submission not found or does not belong to this event");
+    }
+  }
+
+  return prisma.award.update({
+    where: { id: awardId },
     data: {
       submissionId,
-      overrideReason,
+      overrideReason: overrideReason ? overrideReason.trim().slice(0, 500) : null,
     },
   });
 }

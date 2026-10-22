@@ -30,7 +30,24 @@ export async function saveSubmissionDraft(
     customAnswers?: Record<string, unknown>;
   },
 ) {
+  const event = await prisma.event.findUnique({ where: { id: eventId } });
+  if (
+    event?.submissionClosesAt &&
+    new Date() > new Date(event.submissionClosesAt)
+  ) {
+    throw new Error("Submission deadline has passed. Drafts can no longer be edited.");
+  }
+
   const { trackId, customAnswers, ...rest } = data;
+
+  if (trackId) {
+    const track = await prisma.track.findFirst({
+      where: { id: trackId, eventId },
+    });
+    if (!track) {
+      throw new Error("Selected track does not belong to this event");
+    }
+  }
 
   return prisma.submission.upsert({
     where: { teamId },
@@ -76,6 +93,15 @@ export async function submitSubmission(
 
   const { trackId, customAnswers, ...rest } = data;
 
+  if (trackId) {
+    const track = await prisma.track.findFirst({
+      where: { id: trackId, eventId },
+    });
+    if (!track) {
+      throw new Error("Selected track does not belong to this event");
+    }
+  }
+
   return prisma.submission.upsert({
     where: { teamId },
     update: {
@@ -117,8 +143,15 @@ export async function updateSubmissionVisibility(
   judgeable: boolean,
   organizerNotes?: string,
 ) {
-  return prisma.submission.update({
+  const submission = await prisma.submission.findFirst({
     where: { id: submissionId, eventId },
+  });
+  if (!submission) {
+    throw new Error("Submission not found or unauthorized for this event");
+  }
+
+  return prisma.submission.update({
+    where: { id: submissionId },
     data: {
       visibility,
       judgeable,

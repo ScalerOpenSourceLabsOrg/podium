@@ -1,5 +1,12 @@
 import { prisma } from "@/lib/db";
 
+export async function getActiveEvent() {
+  return prisma.event.findFirst({
+    where: { status: "PUBLISHED" },
+    orderBy: { createdAt: "desc" },
+  });
+}
+
 export async function getEventBySlug(slug: string) {
   return prisma.event.findUnique({ where: { slug } });
 }
