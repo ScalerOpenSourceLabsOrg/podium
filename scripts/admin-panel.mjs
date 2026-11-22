@@ -96,6 +96,16 @@ async function removeUserRole(userId, role, slug) {
       where: { eventId: event.id, userId, role },
     });
   } else if (role === "REGISTRANT") {
+    const teamMember = await p.teamMember.findFirst({
+      where: { userId, team: { eventId: event.id } },
+    });
+    if (teamMember) {
+      await p.teamMember.delete({ where: { id: teamMember.id } });
+      const remaining = await p.teamMember.count({ where: { teamId: teamMember.teamId } });
+      if (remaining === 0) {
+        await p.team.delete({ where: { id: teamMember.teamId } });
+      }
+    }
     await p.registration.deleteMany({
       where: { eventId: event.id, userId },
     });
@@ -396,71 +406,133 @@ function checkDockerContainer() {
   });
 }
 
-function getDiskMetrics() {
+function getDockerContainerStats() {
   return new Promise((resolve) => {
-    if (process.platform === "win32") {
-      const psCmd = `powershell -NoProfile -Command "Get-PSDrive -PSProvider FileSystem | Select-Object Root, Free, Used | ConvertTo-Json"`;
-      exec(psCmd, { timeout: 3500 }, (err, stdout) => {
-        if (err || !stdout.trim()) {
-          resolve({ totalGb: 0, usedGb: 0, freeGb: 0, percentUsed: 0 });
-          return;
-        }
-        try {
-          let data = JSON.parse(stdout);
-          if (Array.isArray(data)) data = data[0];
-          const free = Number(data.Free) || 0;
-          const used = Number(data.Used) || 0;
-          const total = free + used;
-          const totalGb = Math.round((total / (1024 * 1024 * 1024)) * 10) / 10;
-          const usedGb = Math.round((used / (1024 * 1024 * 1024)) * 10) / 10;
-          const freeGb = Math.round((free / (1024 * 1024 * 1024)) * 10) / 10;
-          const percentUsed = total > 0 ? Math.round((used / total) * 100) : 0;
-          resolve({ totalGb, usedGb, freeGb, percentUsed });
-        } catch {
-          resolve({ totalGb: 0, usedGb: 0, freeGb: 0, percentUsed: 0 });
-        }
-      });
-    } else {
-      exec("df -kP .", { timeout: 2500 }, (err, stdout) => {
-        if (err || !stdout.trim()) {
-          resolve({ totalGb: 0, usedGb: 0, freeGb: 0, percentUsed: 0 });
-          return;
-        }
-        try {
-          const lines = stdout.trim().split("\n");
-          if (lines.length > 1) {
-            const parts = lines[1].trim().split(/\s+/);
-            const total = parseInt(parts[1], 10) * 1024;
-            const used = parseInt(parts[2], 10) * 1024;
-            const free = parseInt(parts[3], 10) * 1024;
-            const totalGb = Math.round((total / (1024 * 1024 * 1024)) * 10) / 10;
-            const usedGb = Math.round((used / (1024 * 1024 * 1024)) * 10) / 10;
-            const freeGb = Math.round((free / (1024 * 1024 * 1024)) * 10) / 10;
-            const percentUsed = total > 0 ? Math.round((used / total) * 100) : 0;
-            resolve({ totalGb, usedGb, freeGb, percentUsed });
-            return;
-          }
-        } catch {
-          /* fallback */
-        }
-        resolve({ totalGb: 0, usedGb: 0, freeGb: 0, percentUsed: 0 });
-      });
+    const isWin = process.platform === "win32";
+    let cmd = 'docker stats --no-stream --format "{{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.MemPerc}}\t{{.BlockIO}}"';
+    if (isWin && process.env.LOCALAPPDATA) {
+      const winDockerPath = path.join(
+        process.env.LOCALAPPDATA,
+        "Programs",
+        "DockerDesktop",
+        "resources",
+        "bin",
+        "docker.exe"
+      );
+      if (fs.existsSync(winDockerPath)) {
+        cmd = `"${winDockerPath}" stats --no-stream --format "{{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.MemPerc}}\t{{.BlockIO}}"`;
+      }
     }
+
+    exec(cmd, { timeout: 4000 }, (err, stdout) => {
+      if (err || !stdout.trim()) {
+        resolve({
+          name: "podium-db",
+          cpuPerc: "--",
+          cpuNum: 0,
+          memUsage: "--",
+          memPerc: "--",
+          memNum: 0,
+          diskIo: "--",
+          online: false,
+        });
+        return;
+      }
+      const lines = stdout.trim().split("\n");
+      const dbLine =
+        lines.find((l) => l.toLowerCase().includes("podium-db")) ||
+        lines.find((l) => l.toLowerCase().includes("db") || l.toLowerCase().includes("postgres")) ||
+        lines[0];
+      if (!dbLine) {
+        resolve({
+          name: "podium-db",
+          cpuPerc: "--",
+          cpuNum: 0,
+          memUsage: "--",
+          memPerc: "--",
+          memNum: 0,
+          diskIo: "--",
+          online: false,
+        });
+        return;
+      }
+      const parts = dbLine.trim().split("\t");
+      const name = parts[0] || "podium-db";
+      const cpuPerc = parts[1] || "0.0%";
+      const memUsage = parts[2] || "--";
+      const memPerc = parts[3] || "0.0%";
+      const diskIo = parts[4] || "--";
+
+      const cpuNum = parseFloat(cpuPerc.replace("%", "")) || 0;
+      const memNum = parseFloat(memPerc.replace("%", "")) || 0;
+
+      resolve({
+        name,
+        cpuPerc,
+        cpuNum,
+        memUsage,
+        memPerc,
+        memNum,
+        diskIo,
+        online: true,
+      });
+    });
   });
 }
 
+async function getDatabaseStorageStats() {
+  try {
+    const p = getPrisma();
+    const sizeRes = await p.$queryRawUnsafe(`
+      SELECT 
+        pg_database_size(current_database())::text as bytes, 
+        pg_size_pretty(pg_database_size(current_database())) as pretty
+    `);
+    const tablesRes = await p.$queryRawUnsafe(`
+      SELECT 
+        relname as table_name,
+        n_live_tup::text as row_count,
+        pg_size_pretty(pg_total_relation_size(relid)) as total_size
+      FROM pg_stat_user_tables
+      ORDER BY n_live_tup DESC;
+    `);
+
+    const bytes = Number(sizeRes[0]?.bytes || 0);
+    const pretty = sizeRes[0]?.pretty || "0 MB";
+    const tables = (tablesRes || []).map((t) => ({
+      tableName: String(t.table_name),
+      rowCount: Number(t.row_count || 0),
+      totalSize: String(t.total_size),
+    }));
+    const totalRows = tables.reduce((acc, t) => acc + t.rowCount, 0);
+
+    return {
+      online: true,
+      sizeBytes: bytes,
+      sizePretty: pretty,
+      totalRows,
+      tables,
+    };
+  } catch (err) {
+    return {
+      online: false,
+      sizeBytes: 0,
+      sizePretty: "--",
+      totalRows: 0,
+      tables: [],
+      error: err.message,
+    };
+  }
+}
+
 async function collectDiagnostics() {
-  const [dbOnline, appPortOpen, containerStatus, disk] = await Promise.all([
+  const [dbOnline, appPortOpen, containerStatus, containerStats, dbStats] = await Promise.all([
     checkTcpPort("127.0.0.1", 5432),
     checkTcpPort("127.0.0.1", 3000),
     checkDockerContainer(),
-    getDiskMetrics(),
+    getDockerContainerStats(),
+    getDatabaseStorageStats(),
   ]);
-
-  const totalMem = os.totalmem();
-  const freeMem = os.freemem();
-  const usedMem = totalMem - freeMem;
-  const memUsedPercent = Math.round((usedMem / totalMem) * 100);
 
   const errors = [];
   if (!dbOnline) {
@@ -472,11 +544,11 @@ async function collectDiagnostics() {
   if (appState === "STOPPED" && !appPortOpen) {
     errors.push({ code: "ERR_APP_401", level: "info", msg: "Next.js application server is stopped." });
   }
-  if (disk.percentUsed > 90) {
-    errors.push({ code: "ERR_DISK_507", level: "warning", msg: "Low host disk space (>90% full)." });
+  if (containerStats.cpuNum > 85) {
+    errors.push({ code: "ERR_CONTAINER_CPU_505", level: "warning", msg: `High Container CPU usage (${containerStats.cpuPerc}).` });
   }
-  if (memUsedPercent > 92) {
-    errors.push({ code: "ERR_MEM_508", level: "warning", msg: "High host memory usage (>92% RAM)." });
+  if (containerStats.memNum > 85) {
+    errors.push({ code: "ERR_CONTAINER_MEM_506", level: "warning", msg: `High Container Memory usage (${containerStats.memPerc}).` });
   }
 
   return {
@@ -497,21 +569,10 @@ async function collectDiagnostics() {
       docker: {
         online: containerStatus.online,
         info: containerStatus.info,
+        stats: containerStats,
       },
     },
-    system: {
-      platform: `${os.type()} ${os.release()} (${os.arch()})`,
-      uptimeSeconds: Math.floor(os.uptime()),
-      cpuCount: os.cpus().length,
-      loadAvg: os.loadavg().map((n) => Math.round(n * 100) / 100),
-      memory: {
-        totalGb: Math.round((totalMem / (1024 * 1024 * 1024)) * 10) / 10,
-        usedGb: Math.round((usedMem / (1024 * 1024 * 1024)) * 10) / 10,
-        freeGb: Math.round((freeMem / (1024 * 1024 * 1024)) * 10) / 10,
-        percentUsed: memUsedPercent,
-      },
-      disk,
-    },
+    database: dbStats,
   };
 }
 
@@ -617,6 +678,7 @@ function renderDashboardPage(panelPort) {
     .tag-healthy { background: rgba(16, 185, 129, 0.15); color: #10b981; border: 1px solid rgba(16, 185, 129, 0.3); }
     .tag-warning { background: rgba(245, 158, 11, 0.15); color: #f59e0b; border: 1px solid rgba(245, 158, 11, 0.3); }
     .tag-critical { background: rgba(239, 68, 68, 0.15); color: #ef4444; border: 1px solid rgba(239, 68, 68, 0.3); }
+    .tag-info { background: rgba(59, 130, 246, 0.15); color: #60a5fa; border: 1px solid rgba(59, 130, 246, 0.3); }
 
     /* Grid cards */
     .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(360px, 1fr)); gap: 18px; margin-bottom: 24px; }
@@ -729,23 +791,33 @@ function renderDashboardPage(panelPort) {
           </div>
         </div>
 
-        <!-- Database & Container -->
+        <!-- Docker Container Telemetry -->
         <div class="card">
           <div class="card-header">
-            <span class="card-title">Database & Container</span>
-            <span class="status-badge" id="dbStatus">CHECKING</span>
+            <span class="card-title">Docker Container Telemetry</span>
+            <span class="status-badge" id="dockerStatus">CHECKING</span>
           </div>
           <div class="metric-row">
-            <span class="metric-label">PostgreSQL Socket</span>
-            <span class="metric-val" id="dbPortVal">127.0.0.1:5432</span>
+            <span class="metric-label">Container Name</span>
+            <span class="metric-val" id="dockerName">podium-db-1</span>
           </div>
-          <div class="metric-row">
-            <span class="metric-label">Docker Container</span>
-            <span class="metric-val" id="dockerStatus">CHECKING</span>
+          <div>
+            <div class="metric-row" style="border: none;">
+              <span class="metric-label">Container CPU</span>
+              <span class="metric-val" id="containerCpuText">--</span>
+            </div>
+            <div class="bar-bg"><div class="bar-fill" id="containerCpuBar" style="width: 0%; background: #a78bfa;"></div></div>
           </div>
-          <div class="metric-row">
-            <span class="metric-label">Container Info</span>
-            <span class="metric-val" id="dockerInfo" style="font-size: 10px; max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">--</span>
+          <div style="margin-top: 8px;">
+            <div class="metric-row" style="border: none;">
+              <span class="metric-label">Container RAM</span>
+              <span class="metric-val" id="containerMemText">--</span>
+            </div>
+            <div class="bar-bg"><div class="bar-fill" id="containerMemBar" style="width: 0%; background: #38bdf8;"></div></div>
+          </div>
+          <div class="metric-row" style="margin-top: 8px;">
+            <span class="metric-label">Disk I/O (Read / Write)</span>
+            <span class="metric-val" id="containerIoText">--</span>
           </div>
           <div class="btn-group" style="margin-top: 10px;">
             <button class="btn btn-start" onclick="dbAction('start')">START DB</button>
@@ -753,29 +825,29 @@ function renderDashboardPage(panelPort) {
           </div>
         </div>
 
-        <!-- Host Storage & Telemetry -->
+        <!-- Database Storage & Tables -->
         <div class="card">
           <div class="card-header">
-            <span class="card-title">Host Resources & Storage</span>
-            <span class="status-badge status-online">TELEMETRY</span>
+            <span class="card-title">Database Storage & Footprint</span>
+            <span class="status-badge" id="dbStatus">CHECKING</span>
           </div>
-          <div>
-            <div class="metric-row" style="border: none;">
-              <span class="metric-label">Disk Used</span>
-              <span class="metric-val" id="diskText">-- GB / -- GB</span>
-            </div>
-            <div class="bar-bg"><div class="bar-fill" id="diskBar" style="width: 0%;"></div></div>
+          <div class="metric-row">
+            <span class="metric-label">Database Storage Size</span>
+            <span class="metric-val" id="dbSizeText" style="color: #34d399; font-weight: bold; font-size: 13px;">--</span>
+          </div>
+          <div class="metric-row">
+            <span class="metric-label">Total Stored Records</span>
+            <span class="metric-val" id="dbTotalRows">--</span>
+          </div>
+          <div class="metric-row">
+            <span class="metric-label">Engine Socket</span>
+            <span class="metric-val" id="dbPortVal">127.0.0.1:5432 (podium)</span>
           </div>
           <div style="margin-top: 10px;">
-            <div class="metric-row" style="border: none;">
-              <span class="metric-label">RAM Usage</span>
-              <span class="metric-val" id="ramText">-- GB / -- GB</span>
+            <div style="font-size: 10px; color: #9ca3af; text-transform: uppercase; font-weight: bold; margin-bottom: 6px;">Top Database Tables</div>
+            <div id="dbTablesList" style="display: flex; flex-direction: column; gap: 4px; max-height: 105px; overflow-y: auto;">
+              <div style="color: #6b7280; font-size: 11px;">Loading table footprint...</div>
             </div>
-            <div class="bar-bg"><div class="bar-fill" id="ramBar" style="width: 0%; background: #38bdf8;"></div></div>
-          </div>
-          <div class="metric-row" style="margin-top: 10px;">
-            <span class="metric-label">CPU Cores / Load</span>
-            <span class="metric-val" id="cpuText">--</span>
           </div>
         </div>
       </div>
@@ -966,21 +1038,51 @@ function renderDashboardPage(panelPort) {
         dbBadge.innerText = data.services.postgres.online ? 'ONLINE' : 'OFFLINE';
         dbBadge.className = 'status-badge ' + (data.services.postgres.online ? 'status-online' : 'status-offline');
 
-        // Docker
+        // Docker Container Telemetry
+        const docker = data.services.docker;
         const dockerBadge = document.getElementById('dockerStatus');
-        dockerBadge.innerText = data.services.docker.online ? 'ONLINE' : 'STOPPED';
-        dockerBadge.className = 'status-badge ' + (data.services.docker.online ? 'status-online' : 'status-offline');
-        document.getElementById('dockerInfo').innerText = data.services.docker.info;
+        dockerBadge.innerText = docker.online ? 'ONLINE' : 'STOPPED';
+        dockerBadge.className = 'status-badge ' + (docker.online ? 'status-online' : 'status-offline');
+        if (docker.stats) {
+          document.getElementById('dockerName').innerText = docker.stats.name || 'podium-db-1';
+          document.getElementById('containerCpuText').innerText = docker.stats.cpuPerc || '--';
+          document.getElementById('containerCpuBar').style.width = Math.min(docker.stats.cpuNum || 0, 100) + '%';
+          if (docker.stats.cpuNum > 85) {
+            document.getElementById('containerCpuBar').style.background = '#ef4444';
+          } else {
+            document.getElementById('containerCpuBar').style.background = '#a78bfa';
+          }
+          document.getElementById('containerMemText').innerText = (docker.stats.memUsage || '--') + ' (' + (docker.stats.memPerc || '--') + ')';
+          document.getElementById('containerMemBar').style.width = Math.min(docker.stats.memNum || 0, 100) + '%';
+          if (docker.stats.memNum > 85) {
+            document.getElementById('containerMemBar').style.background = '#ef4444';
+          } else {
+            document.getElementById('containerMemBar').style.background = '#38bdf8';
+          }
+          document.getElementById('containerIoText').innerText = docker.stats.diskIo || '--';
+        }
 
-        // Disk & RAM
-        document.getElementById('diskText').innerText = data.system.disk.usedGb + ' GB / ' + data.system.disk.totalGb + ' GB (' + data.system.disk.percentUsed + '%)';
-        document.getElementById('diskBar').style.width = data.system.disk.percentUsed + '%';
-        if (data.system.disk.percentUsed > 85) document.getElementById('diskBar').style.background = '#ef4444';
-
-        document.getElementById('ramText').innerText = data.system.memory.usedGb + ' GB / ' + data.system.memory.totalGb + ' GB (' + data.system.memory.percentUsed + '%)';
-        document.getElementById('ramBar').style.width = data.system.memory.percentUsed + '%';
-
-        document.getElementById('cpuText').innerText = data.system.cpuCount + ' Cores | Load: ' + data.system.loadAvg.join(', ');
+        // Database Storage & Tables
+        const dbStats = data.database;
+        if (dbStats && dbStats.online) {
+          document.getElementById('dbSizeText').innerText = dbStats.sizePretty + ' (' + Number(dbStats.sizeBytes).toLocaleString() + ' B)';
+          document.getElementById('dbTotalRows').innerText = Number(dbStats.totalRows).toLocaleString() + ' records';
+          const tablesList = document.getElementById('dbTablesList');
+          if (dbStats.tables && dbStats.tables.length > 0) {
+            tablesList.innerHTML = dbStats.tables.slice(0, 6).map(function(t) {
+              return '<div style="display: flex; justify-content: space-between; font-size: 11px; padding: 2px 0; border-bottom: 1px solid #14151b;">' +
+                '<span style="color: #d1d5db;">' + escapeHtml(t.tableName) + ' (' + Number(t.rowCount).toLocaleString() + ')</span>' +
+                '<span style="color: #a78bfa; font-weight: 500;">' + escapeHtml(t.totalSize) + '</span>' +
+              '</div>';
+            }).join('');
+          } else {
+            document.getElementById('dbTablesList').innerHTML = '<div style="color: #6b7280; font-size: 11px;">No tables found</div>';
+          }
+        } else {
+          document.getElementById('dbSizeText').innerText = '--';
+          document.getElementById('dbTotalRows').innerText = '--';
+          document.getElementById('dbTablesList').innerHTML = '<div style="color: #f87171; font-size: 11px;">Database offline or unreachable</div>';
+        }
 
         // Diag Banner
         const tagsContainer = document.getElementById('diagTags');
@@ -990,9 +1092,9 @@ function renderDashboardPage(panelPort) {
           document.getElementById('diagSubtitle').innerText = 'All services online and telemetry within safe thresholds.';
         } else {
           document.getElementById('diagSubtitle').innerText = data.errors.length + ' active operational notification(s) detected:';
-          data.errors.forEach(err => {
+          data.errors.forEach(function(err) {
             const span = document.createElement('span');
-            span.className = 'tag ' + (err.level === 'critical' ? 'tag-critical' : 'tag-warning');
+            span.className = 'tag ' + (err.level === 'critical' ? 'tag-critical' : (err.level === 'warning' ? 'tag-warning' : 'tag-info'));
             span.innerText = err.code + ': ' + err.msg;
             tagsContainer.appendChild(span);
           });
@@ -1459,6 +1561,18 @@ async function bootstrap() {
     startNextServer();
   });
 }
+
+process.on("SIGINT", () => {
+  appendSystemLog("Supervisor received SIGINT. Shutting down child processes...");
+  stopNextServer();
+  process.exit(0);
+});
+
+process.on("SIGTERM", () => {
+  appendSystemLog("Supervisor received SIGTERM. Shutting down child processes...");
+  stopNextServer();
+  process.exit(0);
+});
 
 bootstrap().catch((err) => {
   console.error("[CRITICAL] Failed to initialize supervisor:", err);
