@@ -173,6 +173,95 @@ function restartNextServer() {
   return { ok: true, message: "Restarting server..." };
 }
 
+// ─── Autonomous Process Execution ───────────────────────────────────────────
+function runCommand(command, args = []) {
+  return new Promise((resolve) => {
+    const isWin = process.platform === "win32";
+    let cmd = command;
+    const cmdArgs = args;
+
+    if (isWin) {
+      if (command === "npm") cmd = "npm.cmd";
+      else if (command === "npx") cmd = "npx.cmd";
+    }
+
+    const proc = spawn(cmd, cmdArgs, {
+      cwd: ROOT_DIR,
+      env: process.env,
+      stdio: ["ignore", "pipe", "pipe"],
+      shell: isWin,
+    });
+
+    let output = "";
+    proc.stdout?.on("data", (chunk) => {
+      const text = chunk.toString();
+      output += text;
+      for (const line of text.split(/\r?\n/)) {
+        if (line.trim()) {
+          console.log(`[AUTONOMOUS] ${line}`);
+          broadcastLog(`[SETUP] ${line}`);
+        }
+      }
+    });
+
+    proc.stderr?.on("data", (chunk) => {
+      const text = chunk.toString();
+      output += text;
+      for (const line of text.split(/\r?\n/)) {
+        if (line.trim()) {
+          console.error(`[AUTONOMOUS] ${line}`);
+          broadcastLog(`[SETUP] ${line}`);
+        }
+      }
+    });
+
+    proc.on("close", (code) => {
+      resolve({ code: code ?? 0, output });
+    });
+
+    proc.on("error", (err) => {
+      appendSystemLog(`Command execution error: ${err.message}`);
+      resolve({ code: 1, output: err.message });
+    });
+  });
+}
+
+async function ensureDatabaseAndData() {
+  appendSystemLog("[AUTONOMOUS] Checking PostgreSQL database connectivity (port 5432)...");
+  let dbOnline = await checkTcpPort("127.0.0.1", 5432, 1000);
+
+  if (!dbOnline) {
+    appendSystemLog("[AUTONOMOUS] PostgreSQL port 5432 is down. Auto-starting Docker container ('docker compose up -d db')...");
+    await runCommand("docker", ["compose", "up", "-d", "db"]);
+
+    // Poll for up to 20 seconds
+    for (let i = 0; i < 20; i++) {
+      await new Promise((r) => setTimeout(r, 1000));
+      dbOnline = await checkTcpPort("127.0.0.1", 5432, 1000);
+      if (dbOnline) break;
+    }
+  }
+
+  if (dbOnline) {
+    appendSystemLog("[AUTONOMOUS] PostgreSQL is online and accepting connections.");
+
+    // Check if database needs seeding or schema push
+    const checkRes = await runCommand("node", ["scripts/check-seed.mjs"]);
+    if (checkRes.code !== 0) {
+      appendSystemLog("[AUTONOMOUS] Synchronizing database schema with Prisma ('prisma db push')...");
+      await runCommand("npx", ["prisma", "db", "push", "--skip-generate"]);
+
+      appendSystemLog("[AUTONOMOUS] Database has no event data. Automatically seeding initial dataset ('npm run seed')...");
+      await runCommand("npm", ["run", "seed"]);
+      appendSystemLog("[AUTONOMOUS] Automatic database setup and seeding complete!");
+    } else {
+      appendSystemLog("[AUTONOMOUS] Database verified: active events found. Ready for connections.");
+    }
+  } else {
+    appendSystemLog("[WARNING] Could not connect to PostgreSQL on 127.0.0.1:5432. Please ensure Docker is running.");
+  }
+}
+
 // ─── Health Checks & Diagnostics Engine ─────────────────────────────────────
 function checkTcpPort(host, port, timeout = 1200) {
   return new Promise((resolve) => {
@@ -555,6 +644,10 @@ function renderDashboardPage(panelPort) {
           <span class="metric-label">Container Info</span>
           <span class="metric-val" id="dockerInfo" style="font-size: 10px; max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">--</span>
         </div>
+        <div class="btn-group" style="margin-top: 10px;">
+          <button class="btn btn-start" onclick="dbAction('start')">START DB</button>
+          <button class="btn btn-restart" onclick="dbAction('seed')">SEED DEMO DATA</button>
+        </div>
       </div>
 
       <!-- Host Storage & Telemetry -->
@@ -716,6 +809,23 @@ function renderDashboardPage(panelPort) {
         setTimeout(refreshDiagnostics, 500);
       } catch (e) {
         alert('Action failed: ' + e.message);
+      }
+    }
+
+    async function dbAction(action) {
+      try {
+        const btn = event.target;
+        const oldText = btn.innerText;
+        btn.disabled = true;
+        btn.innerText = 'WORKING...';
+        const res = await fetch('/api/db/' + action, { method: 'POST' });
+        const data = await res.json();
+        btn.disabled = false;
+        btn.innerText = oldText;
+        alert(data.message || 'Operation completed.');
+        setTimeout(refreshDiagnostics, 500);
+      } catch (err) {
+        alert('Database action failed: ' + err.message);
       }
     }
 
@@ -894,11 +1004,39 @@ async function bootstrap() {
       return;
     }
 
+    // Database Actions API
+    if (pathname === "/api/db/start" && req.method === "POST") {
+      appendSystemLog("Received request to start database container...");
+      await runCommand("docker", ["compose", "up", "-d", "db"]);
+      let dbOnline = false;
+      for (let i = 0; i < 10; i++) {
+        await new Promise((r) => setTimeout(r, 1000));
+        dbOnline = await checkTcpPort("127.0.0.1", 5432, 1000);
+        if (dbOnline) break;
+      }
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: dbOnline, message: dbOnline ? "Database online!" : "Database failed to start." }));
+      return;
+    }
+
+    if (pathname === "/api/db/seed" && req.method === "POST") {
+      appendSystemLog("Received request to re-seed database...");
+      const resSeed = await runCommand("npm", ["run", "seed"]);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(
+        JSON.stringify({
+          ok: resSeed.code === 0,
+          message: resSeed.code === 0 ? "Database seeded successfully!" : "Seeding failed.",
+        })
+      );
+      return;
+    }
+
     res.writeHead(404, { "Content-Type": "text/plain" });
     res.end("Not Found");
   });
 
-  server.listen(panelPort, "0.0.0.0", () => {
+  server.listen(panelPort, "0.0.0.0", async () => {
     const banner = `
 ================================================================================
   PODIUM // LINUX & WINDOWS ADMIN OPERATIONS PANEL
@@ -913,6 +1051,9 @@ async function bootstrap() {
 `;
     console.log(banner);
     appendSystemLog(`Supervisor initialized. Admin Web Panel listening on http://localhost:${panelPort}`);
+
+    // Autonomous Database & Seed Initialization
+    await ensureDatabaseAndData();
 
     // Auto-boot Next.js app server initially
     startNextServer();
