@@ -4,6 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "panel": "node scripts/admin-panel.mjs",
     "dev": "next dev --turbo",
     "build": "prisma generate && next build",
     "start": "next start",

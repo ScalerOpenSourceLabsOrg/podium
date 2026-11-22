@@ -75,6 +75,7 @@ export default [
       "node_modules/**",
       "components/ui/**",
       "next-env.d.ts",
+      "scripts/**",
     ],
   },
 ];
