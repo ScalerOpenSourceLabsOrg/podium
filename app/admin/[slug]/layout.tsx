@@ -23,6 +23,9 @@ export default async function AdminLayout({
               <Link href={`/admin/${slug}`} className="hover:text-blue-600">
                 Overview
               </Link>
+              <Link href={`/admin/${slug}/users`} className="hover:text-blue-600">
+                Users
+              </Link>
               <Link href={`/admin/${slug}/criteria`} className="hover:text-blue-600">
                 Tracks & Criteria
               </Link>
