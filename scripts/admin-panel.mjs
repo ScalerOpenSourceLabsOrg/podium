@@ -171,15 +171,15 @@ function appendSystemLog(msg) {
 
 function startNextServer() {
   if (appState === "RUNNING" || appState === "STARTING") {
-    return { ok: false, message: "Server is already active." };
+    return { ok: false, message: "Next.js server is already active (" + appState + ")." };
   }
 
   appState = "STARTING";
   appendSystemLog("Initiating Next.js application server (turbopack mode)...");
 
   const isWin = process.platform === "win32";
-  const cmd = isWin ? "npm.cmd run dev" : "npm";
-  const args = isWin ? [] : ["run", "dev"];
+  const cmd = isWin ? "npm.cmd" : "npm";
+  const args = ["run", "dev"];
 
   nextProcess = spawn(cmd, args, {
     cwd: ROOT_DIR,
@@ -219,6 +219,13 @@ function startNextServer() {
     appStartTime = null;
   });
 
+  nextProcess.on("error", (err) => {
+    appendSystemLog(`[ERROR] Next.js process failed to spawn: ${err.message}`);
+    appState = "STOPPED";
+    nextProcess = null;
+    appStartTime = null;
+  });
+
   // Fallback state update after initial boot window
   setTimeout(() => {
     if (appState === "STARTING" && nextProcess) {
@@ -230,24 +237,29 @@ function startNextServer() {
 }
 
 function stopNextServer() {
-  if (!nextProcess || appState === "STOPPED") {
-    appState = "STOPPED";
-    return { ok: true, message: "Server is not running." };
+  if (!nextProcess && appState === "STOPPED") {
+    if (process.platform === "win32") {
+      exec(`powershell -NoProfile -Command "Get-NetTCPConnection -LocalPort 3000 -ErrorAction SilentlyContinue | ForEach-Object { Stop-Process -Id $_.OwningProcess -Force -ErrorAction SilentlyContinue }"`);
+    }
+    return { ok: true, message: "Next.js server is already stopped." };
   }
 
   appendSystemLog("Stopping Next.js application server...");
-  const pid = nextProcess.pid;
+  const pid = nextProcess?.pid;
 
   if (process.platform === "win32") {
-    exec(`taskkill /pid ${pid} /T /F`, (err) => {
-      if (err) appendSystemLog(`Warning during taskkill: ${err.message}`);
-    });
+    if (pid) {
+      exec(`taskkill /pid ${pid} /T /F`, (err) => {
+        if (err) appendSystemLog(`Warning during taskkill: ${err.message}`);
+      });
+    }
+    exec(`powershell -NoProfile -Command "Get-NetTCPConnection -LocalPort 3000 -ErrorAction SilentlyContinue | ForEach-Object { Stop-Process -Id $_.OwningProcess -Force -ErrorAction SilentlyContinue }"`);
   } else {
     try {
-      process.kill(-pid, "SIGTERM");
+      if (pid) process.kill(-pid, "SIGTERM");
     } catch {
       try {
-        nextProcess.kill("SIGTERM");
+        nextProcess?.kill("SIGTERM");
       } catch {
         /* ignore */
       }
@@ -257,7 +269,7 @@ function stopNextServer() {
   appState = "STOPPED";
   nextProcess = null;
   appStartTime = null;
-  return { ok: true, message: "Server stopped." };
+  return { ok: true, message: "Next.js server stopped." };
 }
 
 function restartNextServer() {
@@ -269,6 +281,27 @@ function restartNextServer() {
 }
 
 // ─── Autonomous Process Execution ───────────────────────────────────────────
+function getDockerExecutable() {
+  if (process.platform === "win32") {
+    if (process.env.LOCALAPPDATA) {
+      const p1 = path.join(
+        process.env.LOCALAPPDATA,
+        "Programs",
+        "DockerDesktop",
+        "resources",
+        "bin",
+        "docker.exe"
+      );
+      if (fs.existsSync(p1)) return p1;
+    }
+    if (process.env.ProgramFiles) {
+      const p2 = path.join(process.env.ProgramFiles, "Docker", "Docker", "resources", "bin", "docker.exe");
+      if (fs.existsSync(p2)) return p2;
+    }
+  }
+  return "docker";
+}
+
 function runCommand(command, args = []) {
   return new Promise((resolve) => {
     const isWin = process.platform === "win32";
@@ -278,6 +311,7 @@ function runCommand(command, args = []) {
     if (isWin) {
       if (command === "npm") cmd = "npm.cmd";
       else if (command === "npx") cmd = "npx.cmd";
+      else if (command === "docker") cmd = getDockerExecutable();
     }
 
     const proc = spawn(cmd, cmdArgs, {
@@ -380,21 +414,8 @@ function checkTcpPort(host, port, timeout = 1200) {
 
 function checkDockerContainer() {
   return new Promise((resolve) => {
-    const isWin = process.platform === "win32";
-    let cmd = 'docker ps --filter "name=db" --format "{{.Names}} ({{.Status}})"';
-    if (isWin && process.env.LOCALAPPDATA) {
-      const winDockerPath = path.join(
-        process.env.LOCALAPPDATA,
-        "Programs",
-        "DockerDesktop",
-        "resources",
-        "bin",
-        "docker.exe"
-      );
-      if (fs.existsSync(winDockerPath)) {
-        cmd = `"${winDockerPath}" ps --filter "name=db" --format "{{.Names}} ({{.Status}})"`;
-      }
-    }
+    const dockerExe = getDockerExecutable();
+    const cmd = `"${dockerExe}" ps --filter "name=db" --format "{{.Names}} ({{.Status}})"`;
 
     exec(cmd, { timeout: 3000 }, (err, stdout) => {
       if (err || !stdout.trim()) {
@@ -408,21 +429,8 @@ function checkDockerContainer() {
 
 function getDockerContainerStats() {
   return new Promise((resolve) => {
-    const isWin = process.platform === "win32";
-    let cmd = 'docker stats --no-stream --format "{{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.MemPerc}}\t{{.BlockIO}}"';
-    if (isWin && process.env.LOCALAPPDATA) {
-      const winDockerPath = path.join(
-        process.env.LOCALAPPDATA,
-        "Programs",
-        "DockerDesktop",
-        "resources",
-        "bin",
-        "docker.exe"
-      );
-      if (fs.existsSync(winDockerPath)) {
-        cmd = `"${winDockerPath}" stats --no-stream --format "{{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.MemPerc}}\t{{.BlockIO}}"`;
-      }
-    }
+    const dockerExe = getDockerExecutable();
+    const cmd = `"${dockerExe}" stats --no-stream --format "{{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.MemPerc}}\t{{.BlockIO}}"`;
 
     exec(cmd, { timeout: 4000 }, (err, stdout) => {
       if (err || !stdout.trim()) {
@@ -785,9 +793,9 @@ function renderDashboardPage(panelPort) {
             <span class="metric-val" id="appUptime">--</span>
           </div>
           <div class="btn-group">
-            <button class="btn btn-start" onclick="controlServer('start')">START</button>
-            <button class="btn btn-restart" onclick="controlServer('restart')">RESTART</button>
-            <button class="btn btn-stop" onclick="controlServer('stop')">STOP</button>
+            <button class="btn btn-start" id="btnServerStart" onclick="controlServer('start', this)">START</button>
+            <button class="btn btn-restart" id="btnServerRestart" onclick="controlServer('restart', this)">RESTART</button>
+            <button class="btn btn-stop" id="btnServerStop" onclick="controlServer('stop', this)">STOP</button>
           </div>
         </div>
 
@@ -820,8 +828,8 @@ function renderDashboardPage(panelPort) {
             <span class="metric-val" id="containerIoText">--</span>
           </div>
           <div class="btn-group" style="margin-top: 10px;">
-            <button class="btn btn-start" onclick="dbAction('start')">START DB</button>
-            <button class="btn btn-restart" onclick="dbAction('seed')">SEED DEMO DATA</button>
+            <button class="btn btn-start" id="btnDbStart" onclick="dbAction('start', this)">START DB</button>
+            <button class="btn btn-restart" id="btnDbSeed" onclick="dbAction('seed', this)">SEED DEMO DATA</button>
           </div>
         </div>
 
@@ -1104,29 +1112,90 @@ function renderDashboardPage(panelPort) {
       }
     }
 
-    async function controlServer(action) {
+    function showToast(msg, type) {
+      type = type || 'info';
+      let toast = document.getElementById('panelToast');
+      if (!toast) {
+        toast = document.createElement('div');
+        toast.id = 'panelToast';
+        toast.style.cssText = 'position: fixed; bottom: 24px; right: 24px; z-index: 9999; padding: 12px 20px; border-radius: 8px; font-size: 13px; font-weight: 600; box-shadow: 0 10px 25px rgba(0,0,0,0.5); transition: opacity 0.3s, transform 0.3s; pointer-events: none; opacity: 0; transform: translateY(10px);';
+        document.body.appendChild(toast);
+      }
+      if (type === 'success') {
+        toast.style.background = '#065f46';
+        toast.style.color = '#34d399';
+        toast.style.border = '1px solid #059669';
+      } else if (type === 'warn') {
+        toast.style.background = '#78350f';
+        toast.style.color = '#fbbf24';
+        toast.style.border = '1px solid #d97706';
+      } else if (type === 'error') {
+        toast.style.background = '#7f1d1d';
+        toast.style.color = '#f87171';
+        toast.style.border = '1px solid #dc2626';
+      } else {
+        toast.style.background = '#1e293b';
+        toast.style.color = '#e2e8f0';
+        toast.style.border = '1px solid #334155';
+      }
+      toast.innerText = msg;
+      toast.style.opacity = '1';
+      toast.style.transform = 'translateY(0)';
+      clearTimeout(window.__toastTimeout);
+      window.__toastTimeout = setTimeout(function() {
+        toast.style.opacity = '0';
+        toast.style.transform = 'translateY(10px)';
+      }, 3500);
+    }
+
+    async function controlServer(action, btn) {
+      const originalText = btn ? btn.innerText : '';
+      if (btn) {
+        btn.disabled = true;
+        btn.innerText = 'WORKING...';
+      }
       try {
-        await fetch('/api/server/' + action, { method: 'POST' });
-        setTimeout(refreshDiagnostics, 500);
+        const res = await fetch('/api/server/' + action, { method: 'POST' });
+        const data = await res.json();
+        if (btn) {
+          btn.disabled = false;
+          btn.innerText = originalText;
+        }
+        if (data.message) {
+          showToast(data.message, data.ok ? 'success' : 'warn');
+        }
+        setTimeout(refreshDiagnostics, 400);
       } catch (e) {
-        alert('Action failed: ' + e.message);
+        if (btn) {
+          btn.disabled = false;
+          btn.innerText = originalText;
+        }
+        showToast('Server action failed: ' + e.message, 'error');
       }
     }
 
-    async function dbAction(action) {
+    async function dbAction(action, btn) {
+      const targetBtn = btn || (typeof event !== 'undefined' ? event.target : null);
+      const oldText = targetBtn ? targetBtn.innerText : '';
+      if (targetBtn) {
+        targetBtn.disabled = true;
+        targetBtn.innerText = 'WORKING...';
+      }
       try {
-        const btn = event.target;
-        const oldText = btn.innerText;
-        btn.disabled = true;
-        btn.innerText = 'WORKING...';
         const res = await fetch('/api/db/' + action, { method: 'POST' });
         const data = await res.json();
-        btn.disabled = false;
-        btn.innerText = oldText;
-        alert(data.message || 'Operation completed.');
+        if (targetBtn) {
+          targetBtn.disabled = false;
+          targetBtn.innerText = oldText;
+        }
+        showToast(data.message || 'Operation completed.', data.ok ? 'success' : 'warn');
         setTimeout(refreshDiagnostics, 500);
       } catch (err) {
-        alert('Database action failed: ' + err.message);
+        if (targetBtn) {
+          targetBtn.disabled = false;
+          targetBtn.innerText = oldText;
+        }
+        showToast('Database action failed: ' + err.message, 'error');
       }
     }
 
@@ -1458,15 +1527,27 @@ async function bootstrap() {
     // Database Actions API
     if (pathname === "/api/db/start" && req.method === "POST") {
       appendSystemLog("Received request to start database container...");
-      await runCommand("docker", ["compose", "up", "-d", "db"]);
-      let dbOnline = false;
-      for (let i = 0; i < 10; i++) {
+      let dbOnline = await checkTcpPort("127.0.0.1", 5432, 1000);
+      if (dbOnline) {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true, message: "PostgreSQL database is already online and healthy on port 5432." }));
+        return;
+      }
+      const startRes = await runCommand("docker", ["compose", "up", "-d", "db"]);
+      for (let i = 0; i < 12; i++) {
         await new Promise((r) => setTimeout(r, 1000));
         dbOnline = await checkTcpPort("127.0.0.1", 5432, 1000);
         if (dbOnline) break;
       }
       res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ ok: dbOnline, message: dbOnline ? "Database online!" : "Database failed to start." }));
+      res.end(
+        JSON.stringify({
+          ok: dbOnline,
+          message: dbOnline
+            ? "Database container started successfully!"
+            : "Database failed to start: " + (startRes.output || "Docker startup timeout."),
+        })
+      );
       return;
     }
 
@@ -1477,7 +1558,7 @@ async function bootstrap() {
       res.end(
         JSON.stringify({
           ok: resSeed.code === 0,
-          message: resSeed.code === 0 ? "Database seeded successfully!" : "Seeding failed.",
+          message: resSeed.code === 0 ? "Database seeded successfully!" : "Seeding failed: " + resSeed.output,
         })
       );
       return;
