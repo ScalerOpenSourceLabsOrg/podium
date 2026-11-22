@@ -1030,7 +1030,10 @@ function renderDashboardPage(panelPort) {
     };
 
     // Diagnostics Polling
+    let isPolling = false;
     async function refreshDiagnostics() {
+      if (isPolling) return;
+      isPolling = true;
       try {
         const res = await fetch('/api/diagnostics');
         const data = await res.json();
@@ -1109,6 +1112,8 @@ function renderDashboardPage(panelPort) {
         }
       } catch (e) {
         console.error('Diag poll failed', e);
+      } finally {
+        isPolling = false;
       }
     }
 
@@ -1280,7 +1285,7 @@ function renderDashboardPage(panelPort) {
               }
               return '<span style="display: inline-flex; align-items: center; gap: 6px; padding: 2px 8px; border-radius: 4px; font-size: 10px; font-weight: bold; margin: 2px; ' + badgeStyle + '">' +
                 roleName + ' (' + r.slug + ') ' +
-                '<button onclick="removeUserRole(\'' + u.id + '\', \'' + r.role + '\', \'' + r.slug + '\')" style="background: none; border: none; color: inherit; cursor: pointer; font-size: 12px; margin-left: 4px; line-height: 1;" title="Revoke role">&times;</button>' +
+                '<button data-uid="' + u.id + '" data-role="' + r.role + '" data-slug="' + r.slug + '" onclick="handleRevokeClick(this)" style="background: none; border: none; color: inherit; cursor: pointer; font-size: 12px; margin-left: 4px; line-height: 1;" title="Revoke role">&times;</button>' +
               '</span>';
             }).join('');
 
@@ -1330,6 +1335,11 @@ function renderDashboardPage(panelPort) {
       } catch (err) {
         alert('Error: ' + err.message);
       }
+    }
+
+    function handleRevokeClick(btn) {
+      if (!btn || !btn.dataset) return;
+      removeUserRole(btn.dataset.uid, btn.dataset.role, btn.dataset.slug);
     }
 
     async function removeUserRole(userId, role, slug) {
