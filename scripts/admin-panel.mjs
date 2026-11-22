@@ -13,10 +13,95 @@ import fs from "node:fs";
 import path from "node:path";
 import { spawn, exec } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { PrismaClient } from "@prisma/client";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const ROOT_DIR = path.resolve(__dirname, "..");
+
+let prisma = null;
+function getPrisma() {
+  if (!prisma) {
+    prisma = new PrismaClient();
+  }
+  return prisma;
+}
+
+async function getUsersList() {
+  const p = getPrisma();
+  const users = await p.user.findMany({
+    include: {
+      memberships: { include: { event: { select: { slug: true, name: true } } } },
+      registrations: { include: { event: { select: { slug: true, name: true } } } },
+    },
+    orderBy: { createdAt: "desc" },
+  });
+
+  return users.map((u) => ({
+    id: u.id,
+    name: u.name,
+    email: u.email,
+    createdAt: u.createdAt,
+    roles: [
+      ...u.memberships.map((m) => ({ role: m.role, slug: m.event.slug, name: m.event.name })),
+      ...u.registrations.map((r) => ({ role: "REGISTRANT", slug: r.event.slug, name: r.event.name })),
+    ],
+  }));
+}
+
+async function addUserRole(email, role, slug, name) {
+  const p = getPrisma();
+  const event = await p.event.findUnique({ where: { slug } });
+  if (!event) throw new Error(`Event '${slug}' not found.`);
+
+  const cleanEmail = email.trim().toLowerCase();
+  const user = await p.user.upsert({
+    where: { email: cleanEmail },
+    update: name ? { name } : {},
+    create: { email: cleanEmail, name: name || cleanEmail.split("@")[0] },
+  });
+
+  if (role === "ORGANIZER" || role === "JUDGE") {
+    await p.eventMembership.upsert({
+      where: { eventId_userId_role: { eventId: event.id, userId: user.id, role } },
+      update: {},
+      create: { eventId: event.id, userId: user.id, role },
+    });
+  } else if (role === "REGISTRANT") {
+    await p.registration.upsert({
+      where: { eventId_userId: { eventId: event.id, userId: user.id } },
+      update: {},
+      create: { eventId: event.id, userId: user.id },
+    });
+  }
+  return { ok: true, message: `Assigned ${role} role to ${cleanEmail} on ${slug}` };
+}
+
+async function removeUserRole(userId, role, slug) {
+  const p = getPrisma();
+  const event = await p.event.findUnique({ where: { slug } });
+  if (!event) throw new Error(`Event '${slug}' not found.`);
+
+  if (role === "ORGANIZER") {
+    const count = await p.eventMembership.count({
+      where: { eventId: event.id, role: "ORGANIZER" },
+    });
+    if (count <= 1) {
+      throw new Error("Cannot remove the last organizer from the event.");
+    }
+  }
+
+  if (role === "ORGANIZER" || role === "JUDGE") {
+    await p.eventMembership.deleteMany({
+      where: { eventId: event.id, userId, role },
+    });
+  } else if (role === "REGISTRANT") {
+    await p.registration.deleteMany({
+      where: { eventId: event.id, userId },
+    });
+  }
+  return { ok: true, message: `Removed ${role} role from user on ${slug}` };
+}
 
 // ─── Ephemeral Dynamic Credentials ──────────────────────────────────────────
 const RAND_CHARS = "abcdefghjkmnpqrstuvwxyz23456789";
@@ -572,6 +657,13 @@ function renderDashboardPage(panelPort) {
     .log-time { color: #4b5563; margin-right: 8px; user-select: none; }
     .log-sys { color: #38bdf8; font-weight: bold; }
     .log-err { color: #f87171; }
+
+    /* Navigation Tabs */
+    .nav-tab { background: #181920; color: #9ca3af; border: 1px solid #27272a; font-weight: bold; font-size: 11px; padding: 8px 18px; border-radius: 6px; cursor: pointer; transition: 0.15s; font-family: inherit; }
+    .nav-tab:hover { color: #fff; background: #22242e; }
+    .nav-tab.active { background: #10b981; color: #000; border-color: #10b981; }
+    .ext-link { background: #13151c; color: #93c5fd; border: 1px solid #1e293b; padding: 6px 12px; border-radius: 6px; font-size: 11px; text-decoration: none; font-weight: 500; }
+    .ext-link:hover { background: #1e293b; color: #fff; }
   </style>
 </head>
 <body>
@@ -588,106 +680,213 @@ function renderDashboardPage(panelPort) {
       </div>
     </header>
 
-    <!-- Diagnostics Banner -->
-    <div class="diag-banner">
-      <div>
-        <div class="diag-title">SYSTEM HEALTH & DIAGNOSTIC CODES</div>
-        <div id="diagSubtitle" style="font-size: 11px; color: #6b7280; margin-top: 2px;">Evaluating live metrics...</div>
-      </div>
-      <div class="diag-tags" id="diagTags">
-        <span class="tag tag-healthy">CODE_200 // INITIALIZING</span>
-      </div>
+    <!-- Top-Level Navigation Tabs -->
+    <div class="nav-tabs" style="display: flex; gap: 10px; margin-bottom: 24px; border-bottom: 1px solid #1f222e; padding-bottom: 14px; align-items: center; flex-wrap: wrap;">
+      <button class="nav-tab active" id="tabOps" onclick="switchNavTab('ops')">🖥️ SYSTEM & OPERATIONS</button>
+      <button class="nav-tab" id="tabUsers" onclick="switchNavTab('users')">👥 PODIUM USERS & ROLES</button>
+      <div style="flex-grow: 1;"></div>
+      <a href="http://localhost:3000/admin/hackday-26/users" target="_blank" class="ext-link">👥 Next.js User Panel &nearr;</a>
+      <a href="http://localhost:3000/admin/hackday-26" target="_blank" class="ext-link">🏆 Event Organizer Panel &nearr;</a>
     </div>
 
-    <!-- Metrics & Services Grid -->
-    <div class="grid">
-      <!-- App Server Service -->
-      <div class="card">
-        <div class="card-header">
-          <span class="card-title">Next.js App Server</span>
-          <span class="status-badge" id="appStatus">CHECKING</span>
-        </div>
-        <div class="metric-row">
-          <span class="metric-label">Target Port</span>
-          <span class="metric-val">http://localhost:3000</span>
-        </div>
-        <div class="metric-row">
-          <span class="metric-label">Execution Mode</span>
-          <span class="metric-val">next dev --turbo</span>
-        </div>
-        <div class="metric-row">
-          <span class="metric-label">Uptime</span>
-          <span class="metric-val" id="appUptime">--</span>
-        </div>
-        <div class="btn-group">
-          <button class="btn btn-start" onclick="controlServer('start')">START</button>
-          <button class="btn btn-restart" onclick="controlServer('restart')">RESTART</button>
-          <button class="btn btn-stop" onclick="controlServer('stop')">STOP</button>
-        </div>
-      </div>
-
-      <!-- Database & Container -->
-      <div class="card">
-        <div class="card-header">
-          <span class="card-title">Database & Container</span>
-          <span class="status-badge" id="dbStatus">CHECKING</span>
-        </div>
-        <div class="metric-row">
-          <span class="metric-label">PostgreSQL Socket</span>
-          <span class="metric-val" id="dbPortVal">127.0.0.1:5432</span>
-        </div>
-        <div class="metric-row">
-          <span class="metric-label">Docker Container</span>
-          <span class="metric-val" id="dockerStatus">CHECKING</span>
-        </div>
-        <div class="metric-row">
-          <span class="metric-label">Container Info</span>
-          <span class="metric-val" id="dockerInfo" style="font-size: 10px; max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">--</span>
-        </div>
-        <div class="btn-group" style="margin-top: 10px;">
-          <button class="btn btn-start" onclick="dbAction('start')">START DB</button>
-          <button class="btn btn-restart" onclick="dbAction('seed')">SEED DEMO DATA</button>
-        </div>
-      </div>
-
-      <!-- Host Storage & Telemetry -->
-      <div class="card">
-        <div class="card-header">
-          <span class="card-title">Host Resources & Storage</span>
-          <span class="status-badge status-online">TELEMETRY</span>
-        </div>
+    <!-- Operations View -->
+    <div id="viewOps">
+      <!-- Diagnostics Banner -->
+      <div class="diag-banner">
         <div>
-          <div class="metric-row" style="border: none;">
-            <span class="metric-label">Disk Used</span>
-            <span class="metric-val" id="diskText">-- GB / -- GB</span>
+          <div class="diag-title">SYSTEM HEALTH & DIAGNOSTIC CODES</div>
+          <div id="diagSubtitle" style="font-size: 11px; color: #6b7280; margin-top: 2px;">Evaluating live metrics...</div>
+        </div>
+        <div class="diag-tags" id="diagTags">
+          <span class="tag tag-healthy">CODE_200 // INITIALIZING</span>
+        </div>
+      </div>
+
+      <!-- Metrics & Services Grid -->
+      <div class="grid">
+        <!-- App Server Service -->
+        <div class="card">
+          <div class="card-header">
+            <span class="card-title">Next.js App Server</span>
+            <span class="status-badge" id="appStatus">CHECKING</span>
           </div>
-          <div class="bar-bg"><div class="bar-fill" id="diskBar" style="width: 0%;"></div></div>
-        </div>
-        <div style="margin-top: 10px;">
-          <div class="metric-row" style="border: none;">
-            <span class="metric-label">RAM Usage</span>
-            <span class="metric-val" id="ramText">-- GB / -- GB</span>
+          <div class="metric-row">
+            <span class="metric-label">Target Port</span>
+            <span class="metric-val">http://localhost:3000</span>
           </div>
-          <div class="bar-bg"><div class="bar-fill" id="ramBar" style="width: 0%; background: #38bdf8;"></div></div>
+          <div class="metric-row">
+            <span class="metric-label">Execution Mode</span>
+            <span class="metric-val">next dev --turbo</span>
+          </div>
+          <div class="metric-row">
+            <span class="metric-label">Uptime</span>
+            <span class="metric-val" id="appUptime">--</span>
+          </div>
+          <div class="btn-group">
+            <button class="btn btn-start" onclick="controlServer('start')">START</button>
+            <button class="btn btn-restart" onclick="controlServer('restart')">RESTART</button>
+            <button class="btn btn-stop" onclick="controlServer('stop')">STOP</button>
+          </div>
         </div>
-        <div class="metric-row" style="margin-top: 10px;">
-          <span class="metric-label">CPU Cores / Load</span>
-          <span class="metric-val" id="cpuText">--</span>
+
+        <!-- Database & Container -->
+        <div class="card">
+          <div class="card-header">
+            <span class="card-title">Database & Container</span>
+            <span class="status-badge" id="dbStatus">CHECKING</span>
+          </div>
+          <div class="metric-row">
+            <span class="metric-label">PostgreSQL Socket</span>
+            <span class="metric-val" id="dbPortVal">127.0.0.1:5432</span>
+          </div>
+          <div class="metric-row">
+            <span class="metric-label">Docker Container</span>
+            <span class="metric-val" id="dockerStatus">CHECKING</span>
+          </div>
+          <div class="metric-row">
+            <span class="metric-label">Container Info</span>
+            <span class="metric-val" id="dockerInfo" style="font-size: 10px; max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">--</span>
+          </div>
+          <div class="btn-group" style="margin-top: 10px;">
+            <button class="btn btn-start" onclick="dbAction('start')">START DB</button>
+            <button class="btn btn-restart" onclick="dbAction('seed')">SEED DEMO DATA</button>
+          </div>
         </div>
+
+        <!-- Host Storage & Telemetry -->
+        <div class="card">
+          <div class="card-header">
+            <span class="card-title">Host Resources & Storage</span>
+            <span class="status-badge status-online">TELEMETRY</span>
+          </div>
+          <div>
+            <div class="metric-row" style="border: none;">
+              <span class="metric-label">Disk Used</span>
+              <span class="metric-val" id="diskText">-- GB / -- GB</span>
+            </div>
+            <div class="bar-bg"><div class="bar-fill" id="diskBar" style="width: 0%;"></div></div>
+          </div>
+          <div style="margin-top: 10px;">
+            <div class="metric-row" style="border: none;">
+              <span class="metric-label">RAM Usage</span>
+              <span class="metric-val" id="ramText">-- GB / -- GB</span>
+            </div>
+            <div class="bar-bg"><div class="bar-fill" id="ramBar" style="width: 0%; background: #38bdf8;"></div></div>
+          </div>
+          <div class="metric-row" style="margin-top: 10px;">
+            <span class="metric-label">CPU Cores / Load</span>
+            <span class="metric-val" id="cpuText">--</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Live Console -->
+      <div class="console-card">
+        <div class="console-header">
+          <div style="font-size: 11px; font-weight: bold; color: #fff;">LIVE SERVER LOGS & TERMINAL STREAM</div>
+          <div class="console-actions">
+            <input type="text" id="filterInput" class="console-input" placeholder="Filter logs..." oninput="filterLogs()">
+            <button class="btn-sm" id="btnAutoScroll" onclick="toggleAutoScroll()">Auto-Scroll: ON</button>
+            <button class="btn-sm" onclick="clearLogs()">Clear</button>
+          </div>
+        </div>
+        <div id="logBox"></div>
       </div>
     </div>
 
-    <!-- Live Console -->
-    <div class="console-card">
-      <div class="console-header">
-        <div style="font-size: 11px; font-weight: bold; color: #fff;">LIVE SERVER LOGS & TERMINAL STREAM</div>
-        <div class="console-actions">
-          <input type="text" id="filterInput" class="console-input" placeholder="Filter logs..." oninput="filterLogs()">
-          <button class="btn-sm" id="btnAutoScroll" onclick="toggleAutoScroll()">Auto-Scroll: ON</button>
-          <button class="btn-sm" onclick="clearLogs()">Clear</button>
+    <!-- Podium Users View -->
+    <div id="viewUsers" style="display: none;">
+      <!-- Stats bar -->
+      <div style="display: flex; gap: 14px; margin-bottom: 20px; flex-wrap: wrap;">
+        <div class="card" style="flex: 1; min-width: 180px; padding: 14px;">
+          <div style="font-size: 10px; color: #9ca3af; text-transform: uppercase; font-weight: bold;">Total Users</div>
+          <div style="font-size: 24px; font-weight: bold; color: #fff; margin-top: 4px;" id="statTotalUsers">0</div>
+        </div>
+        <div class="card" style="flex: 1; min-width: 180px; padding: 14px;">
+          <div style="font-size: 10px; color: #a78bfa; text-transform: uppercase; font-weight: bold;">Podium Admins / Organizers</div>
+          <div style="font-size: 24px; font-weight: bold; color: #a78bfa; margin-top: 4px;" id="statOrganizers">0</div>
+        </div>
+        <div class="card" style="flex: 1; min-width: 180px; padding: 14px;">
+          <div style="font-size: 10px; color: #f59e0b; text-transform: uppercase; font-weight: bold;">Judges / Evaluators</div>
+          <div style="font-size: 24px; font-weight: bold; color: #f59e0b; margin-top: 4px;" id="statJudges">0</div>
+        </div>
+        <div class="card" style="flex: 1; min-width: 180px; padding: 14px;">
+          <div style="font-size: 10px; color: #06b6d4; text-transform: uppercase; font-weight: bold;">Registrants / Participants</div>
+          <div style="font-size: 24px; font-weight: bold; color: #06b6d4; margin-top: 4px;" id="statRegistrants">0</div>
         </div>
       </div>
-      <div id="logBox"></div>
+
+      <!-- Action & Filter Bar -->
+      <div class="card" style="margin-bottom: 20px; display: flex; justify-content: space-between; align-items: center; gap: 14px; flex-wrap: wrap;">
+        <div style="display: flex; gap: 10px; align-items: center; flex: 1; min-width: 280px;">
+          <input type="text" id="userSearchInput" class="console-input" style="flex: 1; padding: 8px 12px; font-size: 12px;" placeholder="Search users by name or email..." oninput="filterUsersTable()">
+          <select id="userRoleFilter" class="console-input" style="padding: 8px 12px; font-size: 12px; cursor: pointer;" onchange="filterUsersTable()">
+            <option value="ALL">All Roles</option>
+            <option value="ORGANIZER">Admins / Organizers</option>
+            <option value="JUDGE">Judges</option>
+            <option value="REGISTRANT">Registrants</option>
+          </select>
+        </div>
+        <div style="display: flex; gap: 10px;">
+          <button class="btn btn-restart" style="padding: 8px 14px;" onclick="loadUsersTable()">↻ Refresh</button>
+          <button class="btn btn-start" style="padding: 8px 14px;" onclick="openAddUserModal()">+ Assign User Role</button>
+        </div>
+      </div>
+
+      <!-- Users Table Card -->
+      <div class="card" style="overflow-x: auto; padding: 0;">
+        <table style="width: 100%; border-collapse: collapse; text-align: left; font-size: 12px;">
+          <thead>
+            <tr style="border-bottom: 1px solid #1f222e; background: #13151b; color: #9ca3af; text-transform: uppercase; font-size: 10px;">
+              <th style="padding: 12px 16px;">User</th>
+              <th style="padding: 12px 16px;">Assigned Roles & Events</th>
+              <th style="padding: 12px 16px;">Created</th>
+              <th style="padding: 12px 16px; text-align: right;">Action</th>
+            </tr>
+          </thead>
+          <tbody id="usersTableBody">
+            <tr>
+              <td colspan="4" style="padding: 24px; text-align: center; color: #6b7280;">Loading users...</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Add User Modal -->
+    <div id="addUserModal" style="display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.7); backdrop-filter: blur(4px); z-index: 1000; align-items: center; justify-content: center;">
+      <div class="card" style="max-width: 440px; width: 90%; background: #0e1017; border: 1px solid #2d3142; box-shadow: 0 10px 25px rgba(0,0,0,0.5);">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px; border-bottom: 1px solid #1f222e; padding-bottom: 10px;">
+          <div style="font-size: 13px; font-weight: bold; color: #fff;">Assign Podium User Role</div>
+          <button onclick="closeAddUserModal()" style="background: none; border: none; color: #9ca3af; font-size: 16px; cursor: pointer;">&times;</button>
+        </div>
+        <form onsubmit="submitAddUserRole(event)" style="display: flex; flex-direction: column; gap: 12px;">
+          <div>
+            <label style="font-size: 11px; color: #9ca3af; display: block; margin-bottom: 4px;">User Email *</label>
+            <input type="email" id="modalEmail" required placeholder="user@podium.test" class="console-input" style="width: 100%; padding: 8px 10px;">
+          </div>
+          <div>
+            <label style="font-size: 11px; color: #9ca3af; display: block; margin-bottom: 4px;">Display Name (Optional)</label>
+            <input type="text" id="modalName" placeholder="Ada Lovelace" class="console-input" style="width: 100%; padding: 8px 10px;">
+          </div>
+          <div>
+            <label style="font-size: 11px; color: #9ca3af; display: block; margin-bottom: 4px;">Target Role *</label>
+            <select id="modalRole" required class="console-input" style="width: 100%; padding: 8px 10px;">
+              <option value="ORGANIZER">Podium Admin / Organizer</option>
+              <option value="JUDGE">Judge / Evaluator</option>
+              <option value="REGISTRANT">Registrant / Participant</option>
+            </select>
+          </div>
+          <div>
+            <label style="font-size: 11px; color: #9ca3af; display: block; margin-bottom: 4px;">Event Slug *</label>
+            <input type="text" id="modalSlug" required value="hackday-26" class="console-input" style="width: 100%; padding: 8px 10px;">
+          </div>
+          <div style="display: flex; gap: 10px; margin-top: 10px;">
+            <button type="button" onclick="closeAddUserModal()" class="btn btn-stop" style="flex: 1;">Cancel</button>
+            <button type="submit" class="btn btn-start" style="flex: 1;">Assign Role</button>
+          </div>
+        </form>
+      </div>
     </div>
   </div>
 
@@ -826,6 +1025,156 @@ function renderDashboardPage(panelPort) {
         setTimeout(refreshDiagnostics, 500);
       } catch (err) {
         alert('Database action failed: ' + err.message);
+      }
+    }
+
+    // Tab Switching & User Management Panel
+    let cachedUsers = [];
+
+    function switchNavTab(tab) {
+      const isOps = tab === 'ops';
+      document.getElementById('viewOps').style.display = isOps ? 'block' : 'none';
+      document.getElementById('viewUsers').style.display = isOps ? 'none' : 'block';
+      document.getElementById('tabOps').className = 'nav-tab ' + (isOps ? 'active' : '');
+      document.getElementById('tabUsers').className = 'nav-tab ' + (isOps ? '' : 'active');
+      if (!isOps) {
+        loadUsersTable();
+      }
+    }
+
+    async function loadUsersTable() {
+      try {
+        const tbody = document.getElementById('usersTableBody');
+        tbody.innerHTML = '<tr><td colspan="4" style="padding: 24px; text-align: center; color: #6b7280;">Loading users...</td></tr>';
+        const res = await fetch('/api/users');
+        const data = await res.json();
+        if (!data.ok) throw new Error(data.error || 'Failed to load users');
+        cachedUsers = data.users || [];
+        updateUserStats();
+        renderUsersTable(cachedUsers);
+      } catch (err) {
+        document.getElementById('usersTableBody').innerHTML = '<tr><td colspan="4" style="padding: 24px; text-align: center; color: #ef4444;">Error: ' + err.message + '</td></tr>';
+      }
+    }
+
+    function updateUserStats() {
+      document.getElementById('statTotalUsers').innerText = cachedUsers.length;
+      let orgCount = 0;
+      let judgeCount = 0;
+      let regCount = 0;
+      cachedUsers.forEach(u => {
+        u.roles.forEach(r => {
+          if (r.role === 'ORGANIZER') orgCount++;
+          if (r.role === 'JUDGE') judgeCount++;
+          if (r.role === 'REGISTRANT') regCount++;
+        });
+      });
+      document.getElementById('statOrganizers').innerText = orgCount;
+      document.getElementById('statJudges').innerText = judgeCount;
+      document.getElementById('statRegistrants').innerText = regCount;
+    }
+
+    function filterUsersTable() {
+      const q = (document.getElementById('userSearchInput').value || '').toLowerCase().trim();
+      const roleFilter = document.getElementById('userRoleFilter').value;
+      const filtered = cachedUsers.filter(u => {
+        const matchText = (u.name || '').toLowerCase().includes(q) || u.email.toLowerCase().includes(q);
+        const matchRole = roleFilter === 'ALL' || u.roles.some(r => r.role === roleFilter);
+        return matchText && matchRole;
+      });
+      renderUsersTable(filtered);
+    }
+
+    function renderUsersTable(users) {
+      const tbody = document.getElementById('usersTableBody');
+      if (users.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="4" style="padding: 24px; text-align: center; color: #6b7280;">No users match your criteria.</td></tr>';
+        return;
+      }
+      tbody.innerHTML = users.map(u => {
+        const rolesHtml = u.roles.length === 0
+          ? '<span style="color: #6b7280; font-size: 11px;">No active roles</span>'
+          : u.roles.map(r => {
+              let badgeStyle = 'background: #064e3b; color: #34d399;';
+              let roleName = r.role;
+              if (r.role === 'ORGANIZER') {
+                badgeStyle = 'background: #3b2d60; color: #c4b5fd; border: 1px solid #5b21b6;';
+                roleName = 'ADMIN / ORGANIZER';
+              } else if (r.role === 'JUDGE') {
+                badgeStyle = 'background: #451a03; color: #fde68a; border: 1px solid #b45309;';
+                roleName = 'JUDGE';
+              } else if (r.role === 'REGISTRANT') {
+                badgeStyle = 'background: #164e63; color: #a5f3fc; border: 1px solid #0891b2;';
+                roleName = 'REGISTRANT';
+              }
+              return '<span style="display: inline-flex; align-items: center; gap: 6px; padding: 2px 8px; border-radius: 4px; font-size: 10px; font-weight: bold; margin: 2px; ' + badgeStyle + '">' +
+                roleName + ' (' + r.slug + ') ' +
+                '<button onclick="removeUserRole(\'' + u.id + '\', \'' + r.role + '\', \'' + r.slug + '\')" style="background: none; border: none; color: inherit; cursor: pointer; font-size: 12px; margin-left: 4px; line-height: 1;" title="Revoke role">&times;</button>' +
+              '</span>';
+            }).join('');
+
+        const dateStr = u.createdAt ? new Date(u.createdAt).toLocaleDateString() : '--';
+        const displayName = u.name || u.email.split('@')[0];
+        return '<tr style="border-bottom: 1px solid #16171d;">' +
+          '<td style="padding: 12px 16px;">' +
+            '<div style="font-weight: bold; color: #fff;">' + displayName + '</div>' +
+            '<div style="font-size: 11px; color: #6b7280;">' + u.email + '</div>' +
+          '</td>' +
+          '<td style="padding: 12px 16px;">' + rolesHtml + '</td>' +
+          '<td style="padding: 12px 16px; color: #6b7280; font-size: 11px;">' + dateStr + '</td>' +
+          '<td style="padding: 12px 16px; text-align: right;">' +
+            '<a href="http://localhost:3000/admin/hackday-26/users" target="_blank" style="font-size: 11px; color: #38bdf8; text-decoration: none;">View in Next.js &nearr;</a>' +
+          '</td>' +
+        '</tr>';
+      }).join('');
+    }
+
+    function openAddUserModal() {
+      document.getElementById('addUserModal').style.display = 'flex';
+    }
+
+    function closeAddUserModal() {
+      document.getElementById('addUserModal').style.display = 'none';
+    }
+
+    async function submitAddUserRole(e) {
+      e.preventDefault();
+      const email = document.getElementById('modalEmail').value.trim();
+      const name = document.getElementById('modalName').value.trim();
+      const role = document.getElementById('modalRole').value;
+      const slug = document.getElementById('modalSlug').value.trim();
+      if (!email || !role || !slug) return;
+
+      try {
+        const res = await fetch('/api/users/add', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ email, name, role, slug }),
+        });
+        const data = await res.json();
+        if (!data.ok) throw new Error(data.error || 'Failed to add role');
+        closeAddUserModal();
+        alert(data.message);
+        loadUsersTable();
+      } catch (err) {
+        alert('Error: ' + err.message);
+      }
+    }
+
+    async function removeUserRole(userId, role, slug) {
+      if (!confirm('Are you sure you want to revoke the ' + role + ' role from this user on ' + slug + '?')) return;
+      try {
+        const res = await fetch('/api/users/remove', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ userId, role, slug }),
+        });
+        const data = await res.json();
+        if (!data.ok) throw new Error(data.error || 'Failed to remove role');
+        alert(data.message);
+        loadUsersTable();
+      } catch (err) {
+        alert('Error: ' + err.message);
       }
     }
 
@@ -1029,6 +1378,57 @@ async function bootstrap() {
           message: resSeed.code === 0 ? "Database seeded successfully!" : "Seeding failed.",
         })
       );
+      return;
+    }
+
+    // Users Management API
+    if (pathname === "/api/users" && req.method === "GET") {
+      try {
+        const users = await getUsersList();
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true, users }));
+      } catch (err) {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: false, error: err.message }));
+      }
+      return;
+    }
+
+    if (pathname === "/api/users/add" && req.method === "POST") {
+      try {
+        const bodyText = await parseBody(req);
+        const data = JSON.parse(bodyText);
+        if (!data.email || !data.role || !data.slug) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: false, error: "Missing required fields." }));
+          return;
+        }
+        const result = await addUserRole(data.email, data.role, data.slug, data.name);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(result));
+      } catch (err) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: false, error: err.message }));
+      }
+      return;
+    }
+
+    if (pathname === "/api/users/remove" && req.method === "POST") {
+      try {
+        const bodyText = await parseBody(req);
+        const data = JSON.parse(bodyText);
+        if (!data.userId || !data.role || !data.slug) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: false, error: "Missing required fields." }));
+          return;
+        }
+        const result = await removeUserRole(data.userId, data.role, data.slug);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(result));
+      } catch (err) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: false, error: err.message }));
+      }
       return;
     }
 
