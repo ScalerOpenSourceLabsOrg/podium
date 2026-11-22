@@ -2,11 +2,7 @@
 
 import { revalidatePath } from "next/cache";
 import { requireOrganizer } from "@/lib/auth";
-import {
-  createCriterion,
-  createTrack,
-  getEventBySlug,
-} from "@/lib/queries/events";
+import { createCriterion, createTrack, getEventBySlug } from "@/lib/queries/events";
 import { checkInParticipant } from "@/lib/queries/registrations";
 import { updateSubmissionVisibility } from "@/lib/queries/submissions";
 import { generateAndSaveAssignments } from "@/lib/queries/judging";
@@ -14,7 +10,8 @@ import { createAward, setResultsVisibility, updateAwardWinner } from "@/lib/quer
 import { CriterionSchema, TrackSchema } from "@/lib/schemas/event";
 import { ModerationSchema } from "@/lib/schemas/submission";
 import { GenerateAssignmentsSchema } from "@/lib/schemas/judging";
-import { AwardSchema } from "@/lib/schemas/result";
+import { AwardSchema, UpdateAwardWinnerSchema, VisibilitySchema } from "@/lib/schemas/result";
+import { CheckInSchema } from "@/lib/schemas/registration";
 
 export async function createTrackAction(slug: string, formData: FormData) {
   await requireOrganizer(slug);
@@ -25,10 +22,7 @@ export async function createTrackAction(slug: string, formData: FormData) {
     name: formData.get("name"),
     description: formData.get("description") || undefined,
   });
-
-  if (!parsed.success) {
-    return { errors: parsed.error.flatten().fieldErrors };
-  }
+  if (!parsed.success) return { errors: parsed.error.flatten().fieldErrors };
 
   try {
     await createTrack(event.id, parsed.data.name, parsed.data.description);
@@ -51,10 +45,7 @@ export async function createCriterionAction(slug: string, formData: FormData) {
     maxScore: Number(formData.get("maxScore") || 5),
     position: Number(formData.get("position") || 0),
   });
-
-  if (!parsed.success) {
-    return { errors: parsed.error.flatten().fieldErrors };
-  }
+  if (!parsed.success) return { errors: parsed.error.flatten().fieldErrors };
 
   try {
     await createCriterion(event.id, parsed.data);
@@ -67,11 +58,14 @@ export async function createCriterionAction(slug: string, formData: FormData) {
 
 export async function checkInParticipantAction(slug: string, registrationId: string) {
   await requireOrganizer(slug);
+  const parsed = CheckInSchema.safeParse({ registrationId });
+  if (!parsed.success) return { errors: parsed.error.flatten().fieldErrors };
+
   const event = await getEventBySlug(slug);
   if (!event) return { errors: { _form: ["Event not found"] } };
 
   try {
-    await checkInParticipant(event.id, registrationId);
+    await checkInParticipant(event.id, parsed.data.registrationId);
     revalidatePath(`/admin/${slug}/check-in`);
     return { success: true };
   } catch (err: any) {
@@ -90,10 +84,7 @@ export async function updateModerationAction(slug: string, formData: FormData) {
     judgeable: formData.get("judgeable") === "true",
     organizerNotes: formData.get("organizerNotes") || "",
   });
-
-  if (!parsed.success) {
-    return { errors: parsed.error.flatten().fieldErrors };
-  }
+  if (!parsed.success) return { errors: parsed.error.flatten().fieldErrors };
 
   try {
     await updateSubmissionVisibility(
@@ -121,10 +112,7 @@ export async function generateAssignmentsAction(slug: string, formData: FormData
     anchorSubmissionIds,
     round: Number(formData.get("round") || 1),
   });
-
-  if (!parsed.success) {
-    return { errors: parsed.error.flatten().fieldErrors };
-  }
+  if (!parsed.success) return { errors: parsed.error.flatten().fieldErrors };
 
   try {
     await generateAndSaveAssignments(event.id, parsed.data);
@@ -148,10 +136,7 @@ export async function createAwardAction(slug: string, formData: FormData) {
     submissionId: formData.get("submissionId") || null,
     overrideReason: formData.get("overrideReason") || undefined,
   });
-
-  if (!parsed.success) {
-    return { errors: parsed.error.flatten().fieldErrors };
-  }
+  if (!parsed.success) return { errors: parsed.error.flatten().fieldErrors };
 
   try {
     await createAward(event.id, parsed.data);
@@ -167,12 +152,20 @@ export async function updateAwardWinnerAction(slug: string, formData: FormData) 
   const event = await getEventBySlug(slug);
   if (!event) return { errors: { _form: ["Event not found"] } };
 
-  const awardId = formData.get("awardId") as string;
-  const submissionId = (formData.get("submissionId") as string) || null;
-  const overrideReason = (formData.get("overrideReason") as string) || undefined;
+  const parsed = UpdateAwardWinnerSchema.safeParse({
+    awardId: formData.get("awardId"),
+    submissionId: (formData.get("submissionId") as string) || null,
+    overrideReason: (formData.get("overrideReason") as string) || undefined,
+  });
+  if (!parsed.success) return { errors: parsed.error.flatten().fieldErrors };
 
   try {
-    await updateAwardWinner(event.id, awardId, submissionId, overrideReason);
+    await updateAwardWinner(
+      event.id,
+      parsed.data.awardId,
+      parsed.data.submissionId ?? null,
+      parsed.data.overrideReason,
+    );
     revalidatePath(`/admin/${slug}/results`);
     return { success: true };
   } catch (err: any) {
@@ -180,10 +173,17 @@ export async function updateAwardWinnerAction(slug: string, formData: FormData) 
   }
 }
 
-export async function toggleVisibilityAction(slug: string, winnersPublic: boolean, galleryPublic: boolean) {
+export async function toggleVisibilityAction(
+  slug: string,
+  winnersPublic: boolean,
+  galleryPublic: boolean,
+) {
   await requireOrganizer(slug);
+  const parsed = VisibilitySchema.safeParse({ winnersPublic, galleryPublic });
+  if (!parsed.success) return { errors: parsed.error.flatten().fieldErrors };
+
   try {
-    await setResultsVisibility(slug, winnersPublic, galleryPublic);
+    await setResultsVisibility(slug, parsed.data.winnersPublic, parsed.data.galleryPublic);
     revalidatePath(`/admin/${slug}/results`);
     revalidatePath(`/e/${slug}`);
     return { success: true };

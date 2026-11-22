@@ -4,7 +4,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "next dev",
+    "panel": "node scripts/admin-panel.mjs",
+    "dev": "next dev --turbo",
     "build": "prisma generate && next build",
     "start": "next start",
     "lint": "eslint .",
@@ -21,6 +22,7 @@
     "@prisma/client": "^6.19.3",
     "class-variance-authority": "^0.7.1",
     "cn": "^0.3.0",
+    "docker": "^1.0.0",
     "lucide-react": "^1.46.0",
     "next": "^15.5.25",
     "next-auth": "^5.0.0-beta.32",

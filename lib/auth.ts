@@ -68,7 +68,7 @@ const devProviders: Provider[] =
                   update: {},
                   create: { eventId: activeEvent.id, userId: user.id, role: "JUDGE" },
                 });
-              } else if (roleStr === "PARTICIPANT") {
+              } else if (roleStr === "REGISTRANT" || roleStr === "PARTICIPANT") {
                 await prisma.registration.upsert({
                   where: {
                     eventId_userId: { eventId: activeEvent.id, userId: user.id },
@@ -123,22 +123,35 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
   },
 });
 
-export async function requireUser() {
+export async function requireUser(callbackUrl?: string) {
   const session = await auth();
-  if (!session?.user?.id) redirect("/auth/signin");
+  if (!session?.user?.id) {
+    const dest = callbackUrl ? `/auth/signin?callbackUrl=${encodeURIComponent(callbackUrl)}` : "/auth/signin";
+    redirect(dest);
+  }
   return { ...session.user, id: session.user.id };
 }
 
 export async function requireJudge(slug: string) {
-  const user = await requireUser();
-  const roles = await getEventRoles(slug, user.id);
-  if (!roles.includes("JUDGE")) redirect(`/e/${slug}`);
-  return user;
+  const session = await auth();
+  if (!session?.user?.id) {
+    redirect(`/auth/signin?role=JUDGE&callbackUrl=/judge/${encodeURIComponent(slug)}`);
+  }
+  const roles = await getEventRoles(slug, session.user.id);
+  if (!roles.includes("JUDGE")) {
+    redirect(`/access-denied?role=JUDGE&slug=${encodeURIComponent(slug)}`);
+  }
+  return { ...session.user, id: session.user.id };
 }
 
 export async function requireOrganizer(slug: string) {
-  const user = await requireUser();
-  const roles = await getEventRoles(slug, user.id);
-  if (!roles.includes("ORGANIZER")) redirect(`/e/${slug}`);
-  return user;
+  const session = await auth();
+  if (!session?.user?.id) {
+    redirect(`/auth/signin?role=ORGANIZER&callbackUrl=/admin/${encodeURIComponent(slug)}`);
+  }
+  const roles = await getEventRoles(slug, session.user.id);
+  if (!roles.includes("ORGANIZER")) {
+    redirect(`/access-denied?role=ORGANIZER&slug=${encodeURIComponent(slug)}`);
+  }
+  return { ...session.user, id: session.user.id };
 }

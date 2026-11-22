@@ -22,10 +22,27 @@ Tailwind, shadcn/ui, Zod, Auth.js, Resend, Vitest.
 - `app/api/` is for webhooks and file downloads only. Never for our own
   frontend — use server actions.
 - Every query filters by `eventId`. Multi-tenancy is not optional.
+- All timeline-gated operations validate event phase windows (`registrationOpensAt`,
+  `registrationClosesAt`, `submissionOpensAt`, etc.).
+- Event integrity: An event must always retain at least one `ORGANIZER` (anti-lockout).
+- Team integrity: Leader exit automatically promotes earliest joined member; deleting
+  a registration cascades out of teams to prevent orphaned members.
 - `lib/scoring/` is pure functions. No Prisma, no React, no request context,
   no I/O. It takes data and returns data.
 - Auth guards live in `layout.tsx`, not in individual pages.
 - No new dependencies without asking.
+
+## Developer Workflow & Scripts
+
+- `npm run panel`: Cross-platform Node.js supervisor (`scripts/admin-panel.mjs`).
+  Runs on Linux and Windows without external dependencies. Auto-boots the Docker
+  Postgres container (`podium-db-1`), auto-pushes/seeds if database is empty,
+  prints random credentials (`admin_xxxxxxx` + 16-char password) to the console,
+  and provides a web dashboard on port 3001 to manage Next.js on port 3000.
+- `npm run dev`: Next.js development server with Turbopack (`next dev --turbo`).
+- `npm test`: Runs Vitest test suites.
+- `npm run lint` & `npm run typecheck`: ESLint checks and TypeScript verification.
+- Legacy `.bat` scripts are deprecated and removed; `podium.exe` is kept as a Windows backup tool.
 
 ## Where things go
 
@@ -33,10 +50,13 @@ Tailwind, shadcn/ui, Zod, Auth.js, Resend, Vitest.
 |-----------------------------|-----------------------------------------|
 | Route + its UI              | `app/<segment>/page.tsx`                |
 | Mutations for that route    | `app/<segment>/actions.ts`              |
+| User / role management      | `app/admin/[slug]/users/`               |
 | Database access             | `lib/queries/*.ts`                      |
 | Validation schemas          | `lib/schemas/*.ts`                      |
 | Scoring / ranking logic     | `lib/scoring/*.ts`                      |
+| Operations supervisor       | `scripts/admin-panel.mjs`               |
 | Shared UI                   | `components/shared/`, `components/ui/`  |
+| Security & boundary tests   | `tests/security.test.ts`                |
 
 ## Comments
 

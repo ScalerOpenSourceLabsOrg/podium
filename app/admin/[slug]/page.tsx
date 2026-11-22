@@ -23,7 +23,18 @@ export default async function AdminOverviewPage({ params }: Params) {
         </div>
       </div>
 
-      <div className="grid sm:grid-cols-3 gap-6">
+      <div className="grid sm:grid-cols-2 lg:grid-cols-4 gap-6">
+        <div className="border rounded-xl p-6 bg-white dark:bg-neutral-900 dark:border-neutral-800">
+          <div className="text-xs uppercase font-semibold text-neutral-500">Event Roles & Users</div>
+          <div className="text-3xl font-bold mt-2">Manage</div>
+          <Link
+            href={`/admin/${slug}/users`}
+            className="inline-block mt-4 text-xs font-medium text-blue-600 dark:text-blue-400 hover:underline"
+          >
+            Admins, Judges & Registrants &rarr;
+          </Link>
+        </div>
+
         <div className="border rounded-xl p-6 bg-white dark:bg-neutral-900 dark:border-neutral-800">
           <div className="text-xs uppercase font-semibold text-neutral-500">Registrations</div>
           <div className="text-3xl font-bold mt-2">{event._count.registrations}</div>

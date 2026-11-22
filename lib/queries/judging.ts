@@ -38,6 +38,20 @@ export async function saveScore(
   value: number,
   comment: string = "",
 ) {
+  const event = await prisma.event.findUnique({
+    where: { id: eventId },
+    select: { judgingOpensAt: true, judgingClosesAt: true },
+  });
+  if (!event) throw new Error("Event not found");
+
+  const now = new Date();
+  if (event.judgingOpensAt && now < new Date(event.judgingOpensAt)) {
+    throw new Error("Judging has not opened yet");
+  }
+  if (event.judgingClosesAt && now > new Date(event.judgingClosesAt)) {
+    throw new Error("Judging deadline has passed. Scores can no longer be recorded.");
+  }
+
   const assignment = await prisma.assignment.findFirst({
     where: { id: assignmentId, eventId, judgeId },
   });
@@ -45,12 +59,25 @@ export async function saveScore(
     throw new Error("Assignment not found or unauthorized");
   }
 
+  const criterion = await prisma.criterion.findFirst({
+    where: { id: criterionId, eventId },
+  });
+  if (!criterion) {
+    throw new Error("Criterion not found or does not belong to this event");
+  }
+
+  if (value < 0 || value > criterion.maxScore) {
+    throw new Error(`Score value must be between 0 and ${criterion.maxScore}`);
+  }
+
+  const cleanComment = typeof comment === "string" ? comment.trim().slice(0, 2000) : "";
+
   const score = await prisma.score.upsert({
     where: {
       assignmentId_criterionId: { assignmentId, criterionId },
     },
-    update: { value, comment },
-    create: { assignmentId, criterionId, value, comment },
+    update: { value, comment: cleanComment },
+    create: { assignmentId, criterionId, value, comment: cleanComment },
   });
 
   // Check if all criteria scored for this assignment to set completedAt
