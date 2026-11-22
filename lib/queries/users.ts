@@ -1,4 +1,5 @@
 import { prisma } from "@/lib/db";
+import { leaveTeam } from "@/lib/queries/teams";
 
 // Users are global — one person can register for one event and judge another.
 // Their relationship to an event lives in EventMembership and Registration.
@@ -174,6 +175,13 @@ export async function removeEventRegistration(slug: string, userId: string) {
     select: { id: true },
   });
   if (!event) throw new Error("Event not found.");
+
+  const teamMember = await prisma.teamMember.findFirst({
+    where: { userId, team: { eventId: event.id } },
+  });
+  if (teamMember) {
+    await leaveTeam(event.id, userId);
+  }
 
   return prisma.registration.deleteMany({
     where: {

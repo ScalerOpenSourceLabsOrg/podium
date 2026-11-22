@@ -38,6 +38,20 @@ export async function saveScore(
   value: number,
   comment: string = "",
 ) {
+  const event = await prisma.event.findUnique({
+    where: { id: eventId },
+    select: { judgingOpensAt: true, judgingClosesAt: true },
+  });
+  if (!event) throw new Error("Event not found");
+
+  const now = new Date();
+  if (event.judgingOpensAt && now < new Date(event.judgingOpensAt)) {
+    throw new Error("Judging has not opened yet");
+  }
+  if (event.judgingClosesAt && now > new Date(event.judgingClosesAt)) {
+    throw new Error("Judging deadline has passed. Scores can no longer be recorded.");
+  }
+
   const assignment = await prisma.assignment.findFirst({
     where: { id: assignmentId, eventId, judgeId },
   });

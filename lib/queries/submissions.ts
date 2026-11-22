@@ -1,125 +1,81 @@
 import { prisma } from "@/lib/db";
 import type { Prisma } from "@prisma/client";
 
+export type SubmissionInput = {
+  title: string;
+  tagline?: string;
+  descriptionMd?: string;
+  repoUrl?: string;
+  demoUrl?: string;
+  videoUrl?: string;
+  trackId?: string | null;
+  tech?: string[];
+  customAnswers?: Record<string, unknown>;
+};
+
+async function validateSubmissionContext(eventId: string, trackId?: string | null) {
+  const event = await prisma.event.findUnique({
+    where: { id: eventId },
+    select: { submissionOpensAt: true, submissionClosesAt: true },
+  });
+  if (!event) throw new Error("Event not found");
+
+  const now = new Date();
+  if (event.submissionOpensAt && now < new Date(event.submissionOpensAt)) {
+    throw new Error("Submissions have not opened yet");
+  }
+  if (event.submissionClosesAt && now > new Date(event.submissionClosesAt)) {
+    throw new Error("Submission deadline has passed");
+  }
+
+  if (trackId) {
+    const track = await prisma.track.findFirst({ where: { id: trackId, eventId } });
+    if (!track) throw new Error("Selected track does not belong to this event");
+  }
+}
+
 export async function getSubmissionForTeam(eventId: string, teamId: string) {
   return prisma.submission.findUnique({
     where: { teamId, eventId },
     include: {
       track: true,
-      team: {
-        include: {
-          members: { include: { user: true } },
-        },
-      },
+      team: { include: { members: { include: { user: true } } } },
     },
   });
 }
 
-export async function saveSubmissionDraft(
-  eventId: string,
-  teamId: string,
-  data: {
-    title: string;
-    tagline?: string;
-    descriptionMd?: string;
-    repoUrl?: string;
-    demoUrl?: string;
-    videoUrl?: string;
-    trackId?: string | null;
-    tech?: string[];
-    customAnswers?: Record<string, unknown>;
-  },
-) {
-  const event = await prisma.event.findUnique({ where: { id: eventId } });
-  if (
-    event?.submissionClosesAt &&
-    new Date() > new Date(event.submissionClosesAt)
-  ) {
-    throw new Error("Submission deadline has passed. Drafts can no longer be edited.");
-  }
-
+export async function saveSubmissionDraft(eventId: string, teamId: string, data: SubmissionInput) {
+  await validateSubmissionContext(eventId, data.trackId);
   const { trackId, customAnswers, ...rest } = data;
-
-  if (trackId) {
-    const track = await prisma.track.findFirst({
-      where: { id: trackId, eventId },
-    });
-    if (!track) {
-      throw new Error("Selected track does not belong to this event");
-    }
-  }
+  const payload = {
+    ...rest,
+    trackId: trackId || null,
+    customAnswers: (customAnswers ?? {}) as Prisma.InputJsonValue,
+    status: "DRAFT" as const,
+  };
 
   return prisma.submission.upsert({
     where: { teamId },
-    update: {
-      ...rest,
-      trackId: trackId || null,
-      customAnswers: (customAnswers ?? {}) as Prisma.InputJsonValue,
-      status: "DRAFT",
-    },
-    create: {
-      eventId,
-      teamId,
-      ...rest,
-      trackId: trackId || null,
-      customAnswers: (customAnswers ?? {}) as Prisma.InputJsonValue,
-      status: "DRAFT",
-    },
+    update: payload,
+    create: { eventId, teamId, ...payload },
   });
 }
 
-export async function submitSubmission(
-  eventId: string,
-  teamId: string,
-  data: {
-    title: string;
-    tagline?: string;
-    descriptionMd?: string;
-    repoUrl?: string;
-    demoUrl?: string;
-    videoUrl?: string;
-    trackId?: string | null;
-    tech?: string[];
-    customAnswers?: Record<string, unknown>;
-  },
-) {
-  const event = await prisma.event.findUnique({ where: { id: eventId } });
-  if (
-    event?.submissionClosesAt &&
-    new Date() > new Date(event.submissionClosesAt)
-  ) {
-    throw new Error("Submission deadline has passed");
-  }
-
+export async function submitSubmission(eventId: string, teamId: string, data: SubmissionInput) {
+  await validateSubmissionContext(eventId, data.trackId);
   const { trackId, customAnswers, ...rest } = data;
-
-  if (trackId) {
-    const track = await prisma.track.findFirst({
-      where: { id: trackId, eventId },
-    });
-    if (!track) {
-      throw new Error("Selected track does not belong to this event");
-    }
-  }
+  const payload = {
+    ...rest,
+    trackId: trackId || null,
+    customAnswers: (customAnswers ?? {}) as Prisma.InputJsonValue,
+    status: "SUBMITTED" as const,
+    submittedAt: new Date(),
+  };
 
   return prisma.submission.upsert({
     where: { teamId },
-    update: {
-      ...rest,
-      trackId: trackId || null,
-      customAnswers: (customAnswers ?? {}) as Prisma.InputJsonValue,
-      status: "SUBMITTED",
-      submittedAt: new Date(),
-    },
-    create: {
-      eventId,
-      teamId,
-      ...rest,
-      trackId: trackId || null,
-      customAnswers: (customAnswers ?? {}) as Prisma.InputJsonValue,
-      status: "SUBMITTED",
-      submittedAt: new Date(),
-    },
+    update: payload,
+    create: { eventId, teamId, ...payload },
   });
 }
 
@@ -127,9 +83,7 @@ export async function getModerationSubmissions(eventId: string) {
   return prisma.submission.findMany({
     where: { eventId, status: "SUBMITTED" },
     include: {
-      team: {
-        include: { members: { include: { user: true } } },
-      },
+      team: { include: { members: { include: { user: true } } } },
       track: true,
     },
     orderBy: { submittedAt: "desc" },
@@ -146,9 +100,7 @@ export async function updateSubmissionVisibility(
   const submission = await prisma.submission.findFirst({
     where: { id: submissionId, eventId },
   });
-  if (!submission) {
-    throw new Error("Submission not found or unauthorized for this event");
-  }
+  if (!submission) throw new Error("Submission not found or unauthorized for this event");
 
   return prisma.submission.update({
     where: { id: submissionId },
@@ -197,11 +149,7 @@ export async function getGallerySubmissions(
     },
     include: {
       track: true,
-      team: {
-        include: {
-          members: { include: { user: true } },
-        },
-      },
+      team: { include: { members: { include: { user: true } } } },
     },
     orderBy,
   });

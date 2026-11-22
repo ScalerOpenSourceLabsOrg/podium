@@ -16,6 +16,20 @@ export async function registerUser(
   userId: string,
   data: { college?: string; yearOfStudy?: string; phone?: string; answers?: any },
 ) {
+  const event = await prisma.event.findUnique({
+    where: { id: eventId },
+    select: { registrationOpensAt: true, registrationClosesAt: true },
+  });
+  if (!event) throw new Error("Event not found");
+
+  const now = new Date();
+  if (event.registrationOpensAt && now < new Date(event.registrationOpensAt)) {
+    throw new Error("Registration has not opened yet");
+  }
+  if (event.registrationClosesAt && now > new Date(event.registrationClosesAt)) {
+    throw new Error("Registration deadline has passed");
+  }
+
   return prisma.registration.upsert({
     where: { eventId_userId: { eventId, userId } },
     update: data,
